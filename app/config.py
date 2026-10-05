@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     discord_token: str
     discord_application_id: str
     discord_client_id: str
+    discord_main_guild_id: str
 
     database_url: str = ""
 

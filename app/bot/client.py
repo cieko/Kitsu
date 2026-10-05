@@ -18,9 +18,17 @@ class Kitsu(commands.Bot):
 
     async def setup_hook(self):
         await self.load_extension("app.cogs.emoji_gif")
+
+        guild = discord.Object(
+            id=int(settings.discord_main_guild_id)
+        )
+
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+
         await self.tree.sync()
-        
-        print("Slash commands synced globally.")
+
+        print("Slash commands synced globally and to main guild.")
 
     async def on_ready(self):
         print(f"Logged in as {self.user}")
