@@ -1,20 +1,29 @@
 import threading
 
+from waitress import serve
+
 from app.api.app import app
 from app.bot.client import Kitsu
 from app.config import settings
 
 
 def run_web_server():
-    app.run(
+    # app.run(
+    #     host=settings.flask_host,
+    #     port=settings.flask_port,
+    # )
+    serve(
+        app,
         host=settings.flask_host,
         port=settings.flask_port,
+        threads=4,
     )
 
 
 def main():
     web_thread = threading.Thread(
         target=run_web_server,
+        name="kitsu-web-server",
         daemon=True,
     )
     web_thread.start()

@@ -5,6 +5,7 @@ from app.config import settings
 from app.database.repositories.prefix_repository import (
     get_prefix as get_guild_prefix,
 )
+from app.services.schedule_service import ScheduleService
 
 
 class Kitsu(commands.Bot):
@@ -19,6 +20,8 @@ class Kitsu(commands.Bot):
             strip_after_prefix=True,
             intents=intents,
         )
+        
+        self.schedule_service = None
 
     async def setup_hook(self):
         await self.load_extension("app.cogs.emoji_gif")
@@ -26,6 +29,13 @@ class Kitsu(commands.Bot):
 
         await self.load_extension("app.cogs.prefix")
         print("Prefix extension loaded")
+
+        await self.load_extension("app.cogs.schedules")
+        print("Schedules extension loaded")
+
+        self.schedule_service = ScheduleService(self)
+        self.schedule_service.start()
+        print("Schedule service started")
 
         print(f"Loaded commands: {[command.name for command in self.commands]}")
 

@@ -8,6 +8,7 @@ APPLICATION_EMOJIS = {
     "crossunchecked": 1556332779338334351,
     "tickchecked": 1556331542257598595,
     "tickunchecked": 1556331932927660032,
+    "goos": 1558941112247394334,
 }
 
 
