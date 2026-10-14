@@ -1,3 +1,4 @@
+import logging
 import threading
 
 from waitress import serve
@@ -5,6 +6,12 @@ from waitress import serve
 from app.api.app import app
 from app.bot.client import Kitsu
 from app.config import settings
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 def run_web_server():

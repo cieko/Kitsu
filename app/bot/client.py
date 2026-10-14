@@ -20,10 +20,19 @@ class Kitsu(commands.Bot):
             strip_after_prefix=True,
             intents=intents,
         )
-        
+
+        guild_id = getattr(settings, "discord_main_guild_id", None)
+
+        if not guild_id:
+            raise RuntimeError(
+                "DISCORD_MAIN_GUILD_ID must be configured in settings."
+            )
+
+        self.main_guild_id = int(guild_id)
         self.schedule_service = None
 
     async def setup_hook(self):
+        # Load extensions.
         await self.load_extension("app.cogs.emoji_gif")
         print("Emoji GIF extension loaded")
 
@@ -33,54 +42,125 @@ class Kitsu(commands.Bot):
         await self.load_extension("app.cogs.schedules")
         print("Schedules extension loaded")
 
+        await self.load_extension("app.cogs.sticky")
+        print("Sticky extension loaded")
+
+        await self.load_extension("app.cogs.steal_emoji")
+        print("Steal emoji extension loaded")
+
+        # Start the schedule service.
         self.schedule_service = ScheduleService(self)
         self.schedule_service.start()
         print("Schedule service started")
 
-        print(f"Loaded commands: {[command.name for command in self.commands]}")
+        guild = discord.Object(id=self.main_guild_id)
 
-        # guild = discord.Object(
-        #     id=int(settings.discord_main_guild_id)
-        # )
+        # 1. Copy locally defined slash commands to the configured guild.
+        self.tree.copy_global_to(guild=guild)
 
-        # self.tree.copy_global_to(guild=guild)
-        # await self.tree.sync(guild=guild)
+        # 2. Register slash commands in that guild.
+        synced = await self.tree.sync(guild=guild)
+        print(
+            "Synced guild commands:",
+            [command.name for command in synced],
+        )
 
+        # 3. Clear global command definitions locally.
+        # The guild-specific copies have already been synced.
+        self.tree.clear_commands(guild=None)
+
+        # 4. Sync the empty global command list to Discord,
+        # removing globally registered slash commands.
         await self.tree.sync()
+        print("Global slash commands cleared.")
 
-        # print("Slash commands synced globally and to main guild.")
-        print("Slash commands synced globally.")
+        print(
+            "Local global definitions:",
+            [command.name for command in self.tree.get_commands()],
+        )
 
-    async def get_prefix(self, message):
-        if not message.guild:
-            # return commands.when_mentioned_or(",k")(self, message)
+        print(
+            "Guild slash commands:",
+            [
+                command.name
+                for command in self.tree.get_commands(guild=guild)
+            ],
+        )
+
+    async def get_prefix(self, message: discord.Message):
+        # Ignore DMs.
+        if message.guild is None:
             return ",k"
 
-        prefix = await get_guild_prefix(message.guild.id)
+        # Allow prefix commands only in the configured server.
+        if message.guild.id != self.main_guild_id:
+            return "\0"
 
-        # print(f"PREFIX: {prefix!r}")
-        # print(f"PREFIX LENGTH: {len(prefix)}")
+        return await get_guild_prefix(message.guild.id)
 
-        return prefix
+    async def on_message(self, message: discord.Message):
+        # Prefix commands only work in servers, not DMs.
+        if message.guild is None:
+            return
 
-    async def on_message(self, message):
-        # print(f"Message received: {message.content!r}")
-
-        ctx = await self.get_context(message)
-
-        # print(f"Prefix: {ctx.prefix!r}")
-        # print(f"View buffer: {ctx.view.buffer!r}")
-        # print(f"View index: {ctx.view.index}")
-        # print(f"Invoked with: {ctx.invoked_with!r}")
-        # print(f"Command: {ctx.command}")
-
-        command = self.get_command("prefix")
-        # print(f"Registered command: {command}")
-        # print(f"Command aliases: {command.aliases if command else None}")
+        # Ignore messages from every other server.
+        if message.guild.id != self.main_guild_id:
+            return
 
         await self.process_commands(message)
 
+    async def on_guild_join(self, guild: discord.Guild):
+        # Leave any server other than the configured one.
+        if guild.id != self.main_guild_id:
+            print(
+                f"Leaving unauthorized guild: "
+                f"{guild.name} ({guild.id})"
+            )
+            await guild.leave()
+
     async def on_ready(self):
         print(f"Logged in as {self.user}")
-        print(f"Connected to {len(self.guilds)} server(s)")
-        print(f"Loaded commands: {[command.name for command in self.commands]}")
+
+        # Remove any unauthorized servers the bot was already in.
+        for guild in list(self.guilds):
+            if guild.id != self.main_guild_id:
+                print(
+                    f"Leaving unauthorized guild: "
+                    f"{guild.name} ({guild.id})"
+                )
+                await guild.leave()
+
+        guild = self.get_guild(self.main_guild_id)
+
+        if guild:
+            print(
+                f"Connected to authorized server: "
+                f"{guild.name} ({guild.id})"
+            )
+        else:
+            print(
+                f"WARNING: Not connected to configured guild "
+                f"{self.main_guild_id}"
+            )
+
+        print(
+            "Loaded prefix commands:",
+            [command.name for command in self.commands],
+        )
+
+        # get_commands() without a guild returns global definitions.
+        # This should be empty after clearing the global commands.
+        print(
+            "Local global slash commands:",
+            [command.name for command in self.tree.get_commands()],
+        )
+
+        if guild:
+            guild_ref = discord.Object(id=self.main_guild_id)
+            print(
+                "Local guild slash commands:",
+                [
+                    command.name
+                    for command in self.tree.get_commands(guild=guild_ref)
+                ],
+            )
