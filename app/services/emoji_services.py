@@ -9,6 +9,7 @@ APPLICATION_EMOJIS = {
     "tickchecked": 1556331542257598595,
     "tickunchecked": 1556331932927660032,
     "goos": 1558941112247394334,
+    "translate": 1560016093366591539,
 }
 
 

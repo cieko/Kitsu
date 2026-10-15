@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +6,7 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import discord
@@ -17,6 +16,8 @@ from discord.ext import commands
 logger = logging.getLogger(__name__)
 
 STEAL_TIMEOUT = 300
+ASSET_COLOR = discord.Colour(0x7DBBEB)
+CDN_EMOJI_URL = "https://cdn.discordapp.com/emojis"
 
 CUSTOM_EMOJI_PATTERN = re.compile(
     r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?P<id>\d{15,25})>"
@@ -30,8 +31,15 @@ FORWARDED_EMOJI_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+RAW_EMOJI_URL_PATTERN = re.compile(
+    r"https?://cdn\.discordapp\.com/emojis/"
+    r"(?P<id>\d{15,25})\.(?P<ext>png|gif|webp|jpeg|jpg)"
+    r"(?:\?[^\s<>]*)?",
+    re.IGNORECASE,
+)
 
-@dataclass
+
+@dataclass(slots=True)
 class StealItem:
     item_type: Literal["emoji", "sticker"]
     name: str
@@ -41,36 +49,73 @@ class StealItem:
     source_format: str
 
     @property
-    def type_label(self) -> str:
-        return "Custom Emoji" if self.item_type == "emoji" else "Sticker"
-
-    @property
     def export_options(self) -> list[str]:
         if self.source_format == "lottie":
             return ["JSON"]
+
         if self.animated:
             return ["GIF", "APNG"]
+
         if self.source_format == "unknown":
             return ["PNG"]
+
         return ["PNG", "GIF", "WEBP", "JPEG"]
 
 
 def normalize_url(url: str) -> str:
-    return url.replace("\\&", "&").replace("&amp;", "&")
+    return url.replace(r"\&", "&").replace("&amp;", "&")
+
+
+def _emoji_item(
+    *,
+    name: str,
+    emoji_id: int,
+    url: str,
+    extension: str,
+    animated: bool | None = None,
+) -> StealItem:
+    url = normalize_url(url)
+    query = parse_qs(urlparse(url).query)
+
+    is_animated = animated if animated is not None else (
+        extension.lower() == "gif"
+        or query.get("animated", ["false"])[0].lower() == "true"
+    )
+
+    if is_animated:
+        url = (
+            f"{CDN_EMOJI_URL}/{emoji_id}.gif"
+            "?size=4096&quality=lossless"
+        )
+        extension = "gif"
+
+    return StealItem(
+        item_type="emoji",
+        name=name,
+        item_id=emoji_id,
+        url=url,
+        animated=is_animated,
+        source_format=extension.lower(),
+    )
 
 
 def get_custom_emojis(content: str) -> list[StealItem]:
     items: list[StealItem] = []
     seen: set[int] = set()
 
-    def add_item(item: StealItem) -> None:
+    def add(item: StealItem) -> None:
         if item.item_id in seen:
             return
+
         seen.add(item.item_id)
         items.append(item)
+
         logger.info(
             "[STEAL] Emoji found | name=%s | id=%s | animated=%s | format=%s",
-            item.name, item.item_id, item.animated, item.source_format,
+            item.name,
+            item.item_id,
+            item.animated,
+            item.source_format,
         )
 
     for match in CUSTOM_EMOJI_PATTERN.finditer(content):
@@ -78,89 +123,55 @@ def get_custom_emojis(content: str) -> list[StealItem]:
         animated = bool(match.group("animated"))
         extension = "gif" if animated else "png"
 
-        add_item(StealItem(
-            item_type="emoji",
-            name=match.group("name"),
-            item_id=emoji_id,
-            url=(
-                f"https://cdn.discordapp.com/emojis/"
-                f"{emoji_id}.{extension}?size=4096&quality=lossless"
-            ),
-            animated=animated,
-            source_format=extension,
-        ))
+        add(
+            _emoji_item(
+                name=match.group("name"),
+                emoji_id=emoji_id,
+                url=(
+                    f"{CDN_EMOJI_URL}/{emoji_id}.{extension}"
+                    "?size=4096&quality=lossless"
+                ),
+                extension=extension,
+                animated=animated,
+            )
+        )
 
     for match in FORWARDED_EMOJI_PATTERN.finditer(content):
-        url = normalize_url(match.group("url"))
-        extension = match.group("ext").lower()
-        query = parse_qs(urlparse(url).query)
-        animated = (
-            extension == "gif"
-            or query.get("animated", ["false"])[0].lower() == "true"
-        )
-        emoji_id = int(match.group("id"))
-
-        if animated:
-            url = (
-                f"https://cdn.discordapp.com/emojis/"
-                f"{emoji_id}.gif?size=4096&quality=lossless"
+        add(
+            _emoji_item(
+                name=match.group("name"),
+                emoji_id=int(match.group("id")),
+                url=match.group("url"),
+                extension=match.group("ext"),
             )
-            source_format = "gif"
-        else:
-            source_format = extension
+        )
 
-        add_item(StealItem(
-            item_type="emoji",
-            name=match.group("name"),
-            item_id=emoji_id,
-            url=url,
-            animated=animated,
-            source_format=source_format,
-        ))
-
-    raw_url_pattern = re.compile(
-        r"https?://cdn\.discordapp\.com/emojis/"
-        r"(?P<id>\d{15,25})\.(?P<ext>png|gif|webp|jpeg|jpg)"
-        r"(?:\?[^\s<>]*)?",
-        re.IGNORECASE,
-    )
-
-    for match in raw_url_pattern.finditer(content):
+    for match in RAW_EMOJI_URL_PATTERN.finditer(content):
         emoji_id = int(match.group("id"))
+
         if emoji_id in seen:
             continue
 
-        url = normalize_url(match.group(0))
-        extension = match.group("ext").lower()
-        query = parse_qs(urlparse(url).query)
-        animated = (
-            extension == "gif"
-            or query.get("animated", ["false"])[0].lower() == "true"
+        add(
+            _emoji_item(
+                name=f"emoji_{emoji_id}",
+                emoji_id=emoji_id,
+                url=match.group(0),
+                extension=match.group("ext"),
+            )
         )
 
-        if animated:
-            url = (
-                f"https://cdn.discordapp.com/emojis/"
-                f"{emoji_id}.gif?size=4096&quality=lossless"
-            )
-            source_format = "gif"
-        else:
-            source_format = extension
+    logger.info(
+        "[STEAL] Emoji extraction finished | total=%d",
+        len(items),
+    )
 
-        add_item(StealItem(
-            item_type="emoji",
-            name=f"emoji_{emoji_id}",
-            item_id=emoji_id,
-            url=url,
-            animated=animated,
-            source_format=source_format,
-        ))
-
-    logger.info("[STEAL] Emoji extraction finished | total=%d", len(items))
     return items
 
 
-def get_message_stickers(message: discord.Message) -> list[StealItem]:
+def get_message_stickers(
+    message: discord.Message,
+) -> list[StealItem]:
     stickers: list[StealItem] = []
 
     format_map = {
@@ -182,22 +193,41 @@ def get_message_stickers(message: discord.Message) -> list[StealItem]:
             animated=source_format in {"apng", "gif", "lottie"},
             source_format=source_format,
         )
+
         stickers.append(item)
 
         logger.info(
             "[STEAL] Sticker found | name=%s | id=%s | format=%s",
-            item.name, item.item_id, item.source_format,
+            item.name,
+            item.item_id,
+            item.source_format,
         )
 
     return stickers
 
 
+def _embed_text(embed: discord.Embed) -> list[str]:
+    parts = [
+        embed.title or "",
+        embed.description or "",
+        embed.url or "",
+    ]
+
+    for field in embed.fields:
+        parts.extend((field.name or "", field.value or ""))
+
+    return parts
+
+
 def get_message_items(message: discord.Message) -> list[StealItem]:
     logger.info(
-        "[STEAL] Inspecting message | id=%s | author=%s | channel=%s | "
-        "embeds=%d | stickers=%d",
-        message.id, message.author, message.channel.id,
-        len(message.embeds), len(message.stickers),
+        "[STEAL] Inspecting message | id=%s | author=%s | channel=%s "
+        "| embeds=%d | stickers=%d",
+        message.id,
+        message.author,
+        message.channel.id,
+        len(message.embeds),
+        len(message.stickers),
     )
 
     content_parts = [message.content or ""]
@@ -206,48 +236,52 @@ def get_message_items(message: discord.Message) -> list[StealItem]:
         content_parts.append(getattr(snapshot, "content", None) or "")
 
         for embed in getattr(snapshot, "embeds", None) or []:
-            content_parts.extend([
-                embed.title or "",
-                embed.description or "",
-                embed.url or "",
-            ])
-            for field in embed.fields:
-                content_parts.extend([field.name, field.value])
+            content_parts.extend(_embed_text(embed))
 
     for embed in message.embeds:
-        content_parts.extend([
-            embed.title or "",
-            embed.description or "",
-            embed.url or "",
-        ])
-        for field in embed.fields:
-            content_parts.extend([field.name, field.value])
+        content_parts.extend(_embed_text(embed))
 
-    combined_content = "\n".join(content_parts)
-    emojis = get_custom_emojis(combined_content)
+    emojis = get_custom_emojis("\n".join(content_parts))
     stickers = get_message_stickers(message)
+
+    result: list[StealItem] = []
+    seen: set[tuple[str, int]] = set()
+
+    for item in emojis + stickers:
+        key = (item.item_type, item.item_id)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(item)
 
     logger.info(
         "[STEAL] Final extraction | emojis=%d | stickers=%d | total=%d",
-        len(emojis), len(stickers), len(emojis) + len(stickers),
+        len(emojis),
+        len(stickers),
+        len(result),
     )
-    return emojis + stickers
+
+    return result
 
 
 async def download_file(url: str) -> bytes:
-    logger.info("[STEAL] Downloading asset | url=%s", url)
     timeout = aiohttp.ClientTimeout(total=30)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url) as response:
             logger.info(
                 "[STEAL] CDN response | status=%s | content_type=%s",
-                response.status, response.headers.get("Content-Type"),
+                response.status,
+                response.headers.get("Content-Type"),
             )
+
             if response.status != 200:
                 raise RuntimeError(
                     f"Discord CDN returned HTTP {response.status}."
                 )
+
             return await response.read()
 
 
@@ -256,64 +290,75 @@ def convert_image(data: bytes, target_format: str) -> bytes:
         from PIL import Image, ImageSequence
     except ImportError as exc:
         raise RuntimeError(
-            "Image conversion requires Pillow. Run: python -m pip install Pillow"
+            "Image conversion requires Pillow. "
+            "Run: python -m pip install Pillow"
         ) from exc
 
     output = io.BytesIO()
 
     with Image.open(io.BytesIO(data)) as image:
-        original_loop = image.info.get("loop", 0)
+        loop = image.info.get("loop", 0)
+
+        frames = [
+            frame.convert("RGBA")
+            for frame in ImageSequence.Iterator(image)
+        ]
+
+        durations = [
+            frame.info.get("duration", 100) or 100
+            for frame in ImageSequence.Iterator(image)
+        ]
+
+        first = frames[0]
 
         if target_format == "PNG":
-            image.seek(0)
-            image.convert("RGBA").save(output, format="PNG")
+            first.save(output, format="PNG")
 
         elif target_format == "GIF":
-            frames = [
-                frame.convert("RGBA")
-                for frame in ImageSequence.Iterator(image)
-            ]
-            durations = [
-                frame.info.get("duration") or 100
-                for frame in ImageSequence.Iterator(image)
-            ]
+            palette_source = Image.new(
+                "RGBA",
+                first.size,
+                (0, 0, 0, 0),
+            )
 
-            palette_source = Image.new("RGBA", frames[0].size, (0, 0, 0, 0))
             for frame in frames:
                 palette_source.alpha_composite(frame)
 
-            rgb_source = Image.new("RGB", palette_source.size, (0, 0, 0))
+            rgb_source = Image.new("RGB", palette_source.size, "white")
             rgb_source.paste(
                 palette_source.convert("RGB"),
                 mask=palette_source.getchannel("A"),
             )
+
             palette = rgb_source.quantize(
-                colors=255, method=Image.Quantize.MEDIANCUT,
+                colors=255,
+                method=Image.Quantize.MEDIANCUT,
             )
 
             palette_data = (palette.getpalette() + [0] * 768)[:768]
             palette_data[765:768] = [0, 0, 0]
+
             gif_frames = []
 
             for frame in frames:
-                rgba = frame.convert("RGBA")
-                alpha = rgba.getchannel("A")
-                rgb = Image.new("RGB", rgba.size, (0, 0, 0))
-                rgb.paste(rgba.convert("RGB"), mask=alpha)
+                alpha = frame.getchannel("A")
+                rgb = Image.new("RGB", frame.size, "white")
+                rgb.paste(frame.convert("RGB"), mask=alpha)
 
                 indexed = rgb.quantize(
                     palette=palette,
                     dither=Image.Dither.FLOYDSTEINBERG,
                 )
+
                 indexed.putpalette(palette_data)
 
-                indexed_pixels = indexed.load()
+                pixels = indexed.load()
                 alpha_pixels = alpha.load()
 
-                for y in range(rgba.height):
-                    for x in range(rgba.width):
+                for y in range(frame.height):
+                    for x in range(frame.width):
                         if alpha_pixels[x, y] < 128:
-                            indexed_pixels[x, y] = 255
+                            pixels[x, y] = 255
 
                 gif_frames.append(indexed)
 
@@ -323,40 +368,36 @@ def convert_image(data: bytes, target_format: str) -> bytes:
                 save_all=len(gif_frames) > 1,
                 append_images=gif_frames[1:],
                 duration=durations if len(gif_frames) > 1 else 100,
-                loop=original_loop,
+                loop=loop,
                 optimize=False,
                 transparency=255,
                 disposal=2,
             )
 
         elif target_format == "APNG":
-            frames = [
-                frame.convert("RGBA")
-                for frame in ImageSequence.Iterator(image)
-            ]
-            durations = [
-                frame.info.get("duration") or 100
-                for frame in ImageSequence.Iterator(image)
-            ]
-            frames[0].save(
+            first.save(
                 output,
                 format="PNG",
                 save_all=True,
                 append_images=frames[1:],
                 duration=durations if len(frames) > 1 else None,
-                loop=original_loop,
+                loop=loop,
                 default_image=False,
             )
 
         elif target_format == "WEBP":
-            image.seek(0)
-            image.convert("RGBA").save(output, format="WEBP")
+            first.save(
+                output,
+                format="WEBP",
+                save_all=len(frames) > 1,
+                append_images=frames[1:],
+                duration=durations if len(frames) > 1 else None,
+                loop=loop,
+            )
 
         elif target_format == "JPEG":
-            image.seek(0)
-            frame = image.convert("RGBA")
-            background = Image.new("RGB", frame.size, "white")
-            background.paste(frame, mask=frame.getchannel("A"))
+            background = Image.new("RGB", first.size, "white")
+            background.paste(first, mask=first.getchannel("A"))
             background.save(output, format="JPEG", quality=95)
 
         else:
@@ -373,7 +414,10 @@ async def export_item(
 
     if target_format == "JSON":
         if item.source_format != "lottie":
-            raise RuntimeError("JSON export is only supported for Lottie stickers.")
+            raise RuntimeError(
+                "JSON export is only supported for Lottie stickers."
+            )
+
         return data, "json"
 
     if target_format == "GIF" and item.source_format == "gif":
@@ -385,93 +429,33 @@ async def export_item(
     if target_format == "PNG" and item.source_format == "png":
         return data, "png"
 
-    converted = await asyncio.to_thread(convert_image, data, target_format)
+    converted = await asyncio.to_thread(
+        convert_image,
+        data,
+        target_format,
+    )
 
-    extension_map = {
+    extension = {
         "PNG": "png",
         "GIF": "gif",
         "APNG": "png",
         "WEBP": "webp",
         "JPEG": "jpg",
-    }
-    return converted, extension_map[target_format]
+    }[target_format]
 
-
-def build_asset_container(
-    item: StealItem,
-    source_author: str,
-    page: int,
-    total: int,
-    *,
-    include_heading: bool = True,
-) -> discord.ui.Container:
-    """Build the asset details and large media preview."""
-    parts: list[discord.ui.Item] = []
-
-    # if include_heading:
-    #     parts.extend([
-    #         discord.ui.TextDisplay(
-    #             "## [Enlarged Emoji]({item.url})" if item.item_type == "emoji"
-    #             else "# [Enlarged Sticker]({item.url})"
-    #         ),
-    #         discord.ui.Separator(),
-    #     ])
-
-    parts.append(
-        discord.ui.Section(
-            discord.ui.TextDisplay(
-                f"### [Enlarged {'Emoji' if item.item_type == 'emoji' else 'Sticker'}]({item.url})\n"
-                f"-# `{item.item_type}` `{item.name}` `{item.id}`"
-            ),
-            accessory=StealToServerButton(item),
-        )
-    )
-
-    # MediaGallery displays the asset as media, not as a small thumbnail.
-    # Lottie stickers may not preview in Discord, so retain a direct link.
-    if item.source_format != "lottie":
-        parts.append(
-            discord.ui.MediaGallery(
-                discord.MediaGalleryItem(item.url)
-            )
-        )
-    else:
-        parts.append(
-            discord.ui.TextDisplay(
-                f"[Open sticker preview]({item.url})"
-            )
-        )
-
-    parts.extend([
-        discord.ui.Separator(),
-        discord.ui.TextDisplay(f"-# Page **{page + 1}/{total}**"),
-        # discord.ui.Separator(),
-        # discord.ui.TextDisplay(
-        #     f"**{item.name}**\n"
-        #     f"**Type:** {item.type_label}\n"
-        #     f"**Animation:** {'Animated' if item.animated else 'Static'}\n"
-        #     f"**Format:** {item.source_format.upper()}\n"
-        #     f"**Source author:** {source_author}\n\n"
-        #     f"[Open original asset]({item.url})"
-        # ),
-    ])
-
-    return discord.ui.Container(
-        *parts,
-        accent_colour=discord.Colour(0x7DBBEB),
-    )
+    return converted, extension
 
 
 class StealToServerButton(discord.ui.Button):
     def __init__(self, item: StealItem):
         super().__init__(
             label="Steal",
-            style=discord.ButtonStyle.success,
-            emoji="📥",
+            style=discord.ButtonStyle.blurple,
+            emoji="🍥",
         )
         self.item = item
 
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction: discord.Interaction) -> None:
         item = self.item
         guild = interaction.guild
 
@@ -484,12 +468,17 @@ class StealToServerButton(discord.ui.Button):
 
         if item.item_type != "emoji":
             await interaction.response.send_message(
-                "This button currently supports emojis only.",
+                "The Steal button currently supports custom emojis only.",
                 ephemeral=True,
             )
             return
 
-        if not guild.me.guild_permissions.manage_emojis:
+        bot_member = guild.me
+
+        if (
+            bot_member is None
+            or not bot_member.guild_permissions.manage_emojis_and_stickers
+        ):
             await interaction.response.send_message(
                 "I need the **Manage Emojis and Stickers** permission.",
                 ephemeral=True,
@@ -499,39 +488,84 @@ class StealToServerButton(discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(item.url) as response:
-                    if response.status != 200:
-                        await interaction.followup.send(
-                            "Couldn't download this emoji.",
-                            ephemeral=True,
-                        )
-                        return
-
-                    image_bytes = await response.read()
+            image_bytes = await download_file(item.url)
 
             emoji = await guild.create_custom_emoji(
-                name=item.name,
+                name=item.name[:32],
                 image=image_bytes,
                 reason=f"Emoji added by {interaction.user}",
             )
 
             await interaction.followup.send(
-                f"Successfully added {emoji} (`{emoji.name}`) to **{guild.name}**!",
+                f"Successfully added {emoji} (`{emoji.name}`) "
+                f"to **{guild.name}**!",
                 ephemeral=True,
             )
 
         except discord.HTTPException as exc:
+            logger.exception(
+                "[STEAL] Could not add emoji | item_id=%s",
+                item.item_id,
+            )
             await interaction.followup.send(
                 f"Discord couldn't add this emoji: {exc}",
                 ephemeral=True,
             )
+
         except Exception:
-            logging.exception("Failed to steal emoji")
+            logger.exception(
+                "[STEAL] Failed to add emoji | item_id=%s",
+                item.item_id,
+            )
             await interaction.followup.send(
                 "Something went wrong while adding the emoji.",
                 ephemeral=True,
             )
+
+
+def build_asset_container(
+    item: StealItem,
+    page: int,
+    total: int,
+) -> discord.ui.Container:
+    title = "Emoji" if item.item_type == "emoji" else "Sticker"
+
+    parts: list[discord.ui.Item] = [
+        discord.ui.Section(
+            discord.ui.TextDisplay(
+                f"### [Enlarged {title}]({item.url})\n"
+                f"-# `{item.item_type}` `{item.name}` `{item.item_id}`"
+            ),
+            accessory=StealToServerButton(item),
+        ),
+    ]
+
+    if item.source_format == "lottie":
+        parts.append(
+            discord.ui.TextDisplay(
+                f"[Open sticker preview]({item.url})"
+            )
+        )
+    else:
+        parts.append(
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem(item.url)
+            )
+        )
+
+    parts.extend(
+        [
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(
+                f"-# Page **{page + 1}/{total}**"
+            ),
+        ]
+    )
+
+    return discord.ui.Container(
+        *parts,
+        accent_colour=ASSET_COLOR,
+    )
 
 
 class StealEmojiView(discord.ui.LayoutView):
@@ -539,37 +573,23 @@ class StealEmojiView(discord.ui.LayoutView):
         self,
         items: list[StealItem],
         owner_id: int,
-        source_author: str,
+        is_slash: bool = False,
     ):
-        # A fixed five-minute timer is started only after the message is sent.
         super().__init__(timeout=None)
 
         self.items = items
         self.owner_id = owner_id
-        self.source_author = source_author
+        self.is_slash = is_slash
         self.page = 0
-        self.message: discord.Message | discord.InteractionMessage | None = None
+
+        self.message: (
+            discord.Message | discord.InteractionMessage | None
+        ) = None
+
         self.expiry_task: asyncio.Task | None = None
         self.inactive = False
 
-        self.export_select: StealExportSelect | None = None
-        self.previous_button: StealActionButton | None = None
-        self.next_button: StealActionButton | None = None
-        self.make_public_button: MakePublicButton | None = None
-
         self.render_page()
-
-    def start_expiry_timer(self) -> None:
-        if self.expiry_task is not None:
-            self.expiry_task.cancel()
-        self.expiry_task = asyncio.create_task(self._expire_after_timeout())
-
-    async def _expire_after_timeout(self) -> None:
-        try:
-            await asyncio.sleep(STEAL_TIMEOUT)
-            await self.expire_view()
-        except asyncio.CancelledError:
-            pass
 
     def render_page(self) -> None:
         self.clear_items()
@@ -578,56 +598,71 @@ class StealEmojiView(discord.ui.LayoutView):
         total = len(self.items)
 
         container = build_asset_container(
-            item, self.source_author, self.page, total,
+            item,
+            self.page,
+            total,
         )
 
-        options = [
-            discord.SelectOption(
-                label=fmt,
-                value=fmt,
-                description=f"Export as {fmt}",
-            )
-            for fmt in item.export_options
-        ]
-
-        self.export_select = StealExportSelect(self, options)
-        container.add_item(discord.ui.ActionRow(self.export_select))
-
-        self.previous_button = StealActionButton(
-            self, "previous", label="Previous", disabled=self.page == 0,
+        export_select = StealExportSelect(
+            self,
+            [
+                discord.SelectOption(
+                    label=fmt,
+                    value=fmt,
+                    description=f"Export as {fmt}",
+                )
+                for fmt in item.export_options
+            ],
         )
-        self.next_button = StealActionButton(
-            self, "next", label="Next", disabled=self.page >= total - 1,
-        )
+
         container.add_item(
-            discord.ui.ActionRow(self.previous_button, self.next_button)
+            discord.ui.ActionRow(export_select)
         )
 
+        previous = StealActionButton(
+            self,
+            "previous",
+            label="Previous",
+            disabled=self.page == 0,
+        )
+
+        next_button = StealActionButton(
+            self,
+            "next",
+            label="Next",
+            disabled=self.page >= total - 1,
+        )
+
+        container.add_item(
+            discord.ui.ActionRow(previous, next_button)
+        )
+
+        # Main asset preview: shown for both slash and prefix commands.
         self.add_item(container)
 
-        # Second container: private-preview notice + Make Public button.
-        self.make_public_button = MakePublicButton(self)
-        privacy_container = discord.ui.Container(
-            discord.ui.Section(
-                discord.ui.TextDisplay(
-                    "*_Note: Only you can view this emoji preview_*"
-                ),
-                accessory=self.make_public_button,
-            ),
-            accent_colour=discord.Colour.blurple(),
-        )
-        self.add_item(privacy_container)
+        # Privacy note + Make Public: shown only for slash commands.
+        if self.is_slash:
+            self.add_item(
+                discord.ui.Container(
+                    discord.ui.Section(
+                        discord.ui.TextDisplay(
+                            "*_Note: Only you can view this emoji preview_*"
+                        ),
+                        accessory=MakePublicButton(self),
+                    ),
+                    accent_colour=ASSET_COLOR,
+                )
+            )
 
     async def interaction_check(
         self,
         interaction: discord.Interaction,
     ) -> bool:
         if self.inactive:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "This steal menu is now inactive. Run the command again.",
-                    ephemeral=True,
-                )
+            await interaction.response.send_message(
+                "This steal menu is now inactive. Run the command again.",
+                ephemeral=True,
+            )
             return False
 
         if interaction.user.id != self.owner_id:
@@ -639,6 +674,21 @@ class StealEmojiView(discord.ui.LayoutView):
 
         return True
 
+    def start_expiry_timer(self) -> None:
+        if self.expiry_task:
+            self.expiry_task.cancel()
+
+        self.expiry_task = asyncio.create_task(
+            self._expire_after_timeout()
+        )
+
+    async def _expire_after_timeout(self) -> None:
+        try:
+            await asyncio.sleep(STEAL_TIMEOUT)
+            await self.expire_view()
+        except asyncio.CancelledError:
+            pass
+
     async def expire_view(self) -> None:
         if self.inactive:
             return
@@ -647,50 +697,79 @@ class StealEmojiView(discord.ui.LayoutView):
         self.clear_items()
 
         self.add_item(
-            discord.ui.TextDisplay("-# The message is now inactive.")
+            discord.ui.TextDisplay(
+                "-# The message is now inactive."
+            )
         )
 
         item = self.items[self.page]
+
         container = build_asset_container(
-            item, self.source_author, self.page, len(self.items),
+            item,
+            self.page,
+            len(self.items),
         )
 
-        options = [
-            discord.SelectOption(
-                label=fmt,
-                value=fmt,
-                description=f"Export as {fmt}",
-            )
-            for fmt in item.export_options
-        ]
+        # Disable the Steal button when the menu expires.
+        for child in container.children:
+            if isinstance(child, discord.ui.Section):
+                accessory = getattr(child, "accessory", None)
 
-        self.export_select = StealExportSelect(self, options)
-        self.export_select.disabled = True
-        container.add_item(discord.ui.ActionRow(self.export_select))
+                if isinstance(accessory, discord.ui.Button):
+                    accessory.disabled = True
 
-        self.previous_button = StealActionButton(
-            self, "previous", label="Previous", disabled=True,
+        export_select = StealExportSelect(
+            self,
+            [
+                discord.SelectOption(
+                    label=fmt,
+                    value=fmt,
+                    description=f"Export as {fmt}",
+                )
+                for fmt in item.export_options
+            ],
         )
-        self.next_button = StealActionButton(
-            self, "next", label="Next", disabled=True,
-        )
+        export_select.disabled = True
+
         container.add_item(
-            discord.ui.ActionRow(self.previous_button, self.next_button)
+            discord.ui.ActionRow(export_select)
         )
+
+        container.add_item(
+            discord.ui.ActionRow(
+                StealActionButton(
+                    self,
+                    "previous",
+                    label="Previous",
+                    disabled=True,
+                ),
+                StealActionButton(
+                    self,
+                    "next",
+                    label="Next",
+                    disabled=True,
+                ),
+            )
+        )
+
         self.add_item(container)
 
-        self.make_public_button = MakePublicButton(self)
-        self.make_public_button.disabled = True
-        privacy_container = discord.ui.Container(
-            discord.ui.Section(
-                discord.ui.TextDisplay(
-                    "*`_Note: Only you can view this emoji preview_`*"
-                ),
-                accessory=self.make_public_button,
-            ),
-            accent_colour=discord.Colour.blurple(),
-        )
-        self.add_item(privacy_container)
+        # Keep the second container conditional after timeout as well.
+        if self.is_slash:
+            public_button = MakePublicButton(self)
+            public_button.disabled = True
+
+            self.add_item(
+                discord.ui.Container(
+                    discord.ui.Section(
+                        discord.ui.TextDisplay(
+                            "*`_Note: Only you can view this emoji preview_`*"
+                        ),
+                        accessory=public_button,
+                    ),
+                    accent_colour=ASSET_COLOR,
+                )
+            )
 
         if self.message is not None:
             try:
@@ -714,10 +793,14 @@ class StealActionButton(discord.ui.Button):
             style=discord.ButtonStyle.secondary,
             disabled=disabled,
         )
+
         self.parent_view = parent_view
         self.action = action
 
-    async def callback(self, interaction: discord.Interaction) -> None:
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
         view = self.parent_view
 
         if view.inactive:
@@ -744,7 +827,10 @@ class MakePublicButton(discord.ui.Button):
         )
         self.parent_view = parent_view
 
-    async def callback(self, interaction: discord.Interaction) -> None:
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
         view = self.parent_view
 
         if view.inactive:
@@ -754,14 +840,8 @@ class MakePublicButton(discord.ui.Button):
             )
             return
 
-        if interaction.user.id != view.owner_id:
-            await interaction.response.send_message(
-                "Only the person who ran this command can publish this preview.",
-                ephemeral=True,
-            )
-            return
-
         channel = interaction.channel
+
         if channel is None or not hasattr(channel, "send"):
             await interaction.response.send_message(
                 "I couldn't publish the preview in this channel.",
@@ -770,15 +850,15 @@ class MakePublicButton(discord.ui.Button):
             return
 
         item = view.items[view.page]
-        public_container = build_asset_container(
-            item,
-            view.source_author,
-            view.page,
-            len(view.items),
-        )
-
         public_view = discord.ui.LayoutView(timeout=None)
-        public_view.add_item(public_container)
+
+        public_view.add_item(
+            build_asset_container(
+                item,
+                view.page,
+                len(view.items),
+            )
+        )
 
         try:
             await channel.send(view=public_view)
@@ -788,7 +868,8 @@ class MakePublicButton(discord.ui.Button):
                 item.item_id,
             )
             await interaction.response.send_message(
-                "I couldn't publish the preview. Check the bot's channel permissions.",
+                "I couldn't publish the preview. "
+                "Check the bot's channel permissions.",
                 ephemeral=True,
             )
             return
@@ -813,7 +894,10 @@ class StealExportSelect(discord.ui.Select):
         )
         self.parent_view = parent_view
 
-    async def callback(self, interaction: discord.Interaction) -> None:
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
         view = self.parent_view
 
         if view.inactive:
@@ -826,22 +910,42 @@ class StealExportSelect(discord.ui.Select):
         item = view.items[view.page]
         selected_format = self.values[0]
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
 
         try:
-            data, extension = await export_item(item, selected_format)
-            safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", item.name)[:50]
+            data, extension = await export_item(
+                item,
+                selected_format,
+            )
+
+            safe_name = re.sub(
+                r"[^A-Za-z0-9_-]",
+                "_",
+                item.name,
+            )[:50]
+
             filename = f"{safe_name or 'discord_asset'}.{extension}"
 
             await interaction.followup.send(
-                content=f"Exported **{item.name}** as **{selected_format}**.",
-                file=discord.File(io.BytesIO(data), filename=filename),
+                content=(
+                    f"Exported **{item.name}** "
+                    f"as **{selected_format}**."
+                ),
+                file=discord.File(
+                    io.BytesIO(data),
+                    filename=filename,
+                ),
                 ephemeral=True,
             )
+
         except Exception:
             logger.exception(
                 "[STEAL] Export failed | item_id=%s | format=%s",
-                item.item_id, selected_format,
+                item.item_id,
+                selected_format,
             )
             await interaction.followup.send(
                 "Export failed. Check the bot console logs for details.",
@@ -858,50 +962,68 @@ class StealEmoji(commands.Cog):
         *,
         items: list[StealItem],
         owner_id: int,
-        source_author: str,
         ctx: commands.Context | None = None,
         interaction: discord.Interaction | None = None,
     ) -> None:
         if not items:
-            logger.warning("[STEAL] No emoji or sticker items found.")
             message = (
-                "I couldn't find any custom emojis or stickers in that message. "
-                "Check the bot logs for extraction details."
+                "I couldn't find any custom emojis or stickers "
+                "in that message."
             )
 
             if interaction is not None:
                 await interaction.response.send_message(
-                    message, ephemeral=True,
+                    message,
+                    ephemeral=True,
                 )
             elif ctx is not None:
-                await ctx.reply(message, mention_author=False)
+                await ctx.reply(
+                    message,
+                    mention_author=False,
+                )
+
             return
 
-        view = StealEmojiView(items, owner_id, source_author)
+        # This flag determines whether the second container appears.
+        view = StealEmojiView(
+            items=items,
+            owner_id=owner_id,
+            is_slash=interaction is not None,
+        )
 
         if interaction is not None:
-            await interaction.response.send_message(view=view, ephemeral=True)
+            await interaction.response.send_message(
+                view=view,
+                ephemeral=True,
+            )
             view.message = await interaction.original_response()
+
         elif ctx is not None:
-            # Prefix-command replies cannot be ephemeral.
+            # Prefix-command previews are public.
             view.message = await ctx.reply(
-                view=view, mention_author=False,
+                view=view,
+                mention_author=False,
             )
 
         view.start_expiry_timer()
 
     @commands.command(name="steal")
-    async def steal_prefix(self, ctx: commands.Context) -> None:
+    async def steal_prefix(
+        self,
+        ctx: commands.Context,
+    ) -> None:
         reference = ctx.message.reference
 
         logger.info(
             "[STEAL] Prefix command | user=%s | message_id=%s",
-            ctx.author, ctx.message.id,
+            ctx.author,
+            ctx.message.id,
         )
 
         if reference is None:
             await ctx.reply(
-                "Reply to a message containing emojis or stickers, then run the steal command.",
+                "Reply to a message containing emojis or stickers, "
+                "then run the steal command.",
                 mention_author=False,
             )
             return
@@ -917,9 +1039,13 @@ class StealEmoji(commands.Cog):
                 return
 
             try:
-                message = await ctx.channel.fetch_message(reference.message_id)
+                message = await ctx.channel.fetch_message(
+                    reference.message_id
+                )
             except discord.HTTPException:
-                logger.exception("[STEAL] Failed to fetch replied-to message")
+                logger.exception(
+                    "[STEAL] Failed to fetch replied-to message"
+                )
                 await ctx.reply(
                     "I couldn't retrieve the referenced message.",
                     mention_author=False,
@@ -929,7 +1055,6 @@ class StealEmoji(commands.Cog):
         await self.show_results(
             items=get_message_items(message),
             owner_id=ctx.author.id,
-            source_author=str(message.author),
             ctx=ctx,
         )
 
@@ -938,24 +1063,21 @@ class StealEmoji(commands.Cog):
         description="Extract custom emojis and stickers from a message.",
     )
     @app_commands.describe(
-        message_id="ID of a message in this channel",
-        forwarded="Whether the message is a forwarded message",
+        message_id="ID of a message in this channel"
     )
     @app_commands.guild_only()
     async def steal_slash(
         self,
         interaction: discord.Interaction,
         message_id: str,
-        forwarded: bool = False,
     ) -> None:
         channel = interaction.channel
 
         logger.info(
-            "[STEAL] Slash command | user=%s | channel=%s | message_id=%r | forwarded=%s",
+            "[STEAL] Slash command | user=%s | channel=%s | message_id=%r",
             interaction.user,
             getattr(channel, "id", None),
             message_id,
-            forwarded,
         )
 
         if channel is None or not hasattr(channel, "fetch_message"):
@@ -967,8 +1089,10 @@ class StealEmoji(commands.Cog):
 
         try:
             target_id = int(message_id)
+
             if target_id <= 0:
                 raise ValueError
+
         except ValueError:
             await interaction.response.send_message(
                 "Please provide a valid message ID.",
@@ -979,7 +1103,9 @@ class StealEmoji(commands.Cog):
         try:
             message = await channel.fetch_message(target_id)
         except discord.HTTPException:
-            logger.exception("[STEAL] Failed to fetch slash-command target")
+            logger.exception(
+                "[STEAL] Failed to fetch slash-command target"
+            )
             await interaction.response.send_message(
                 "I couldn't retrieve that message from this channel.",
                 ephemeral=True,
@@ -989,10 +1115,10 @@ class StealEmoji(commands.Cog):
         await self.show_results(
             items=get_message_items(message),
             owner_id=interaction.user.id,
-            source_author=str(message.author),
             interaction=interaction,
         )
 
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(StealEmoji(bot))
+
