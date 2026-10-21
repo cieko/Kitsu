@@ -51,6 +51,9 @@ class Kitsu(commands.Bot):
         await self.load_extension("app.cogs.translation")
         print("Translation extension loaded")
 
+        await self.load_extension("app.cogs.ghosty")
+        print("Ghosty extension loaded")
+
         # Start the schedule service.
         self.schedule_service = ScheduleService(self)
         self.schedule_service.start()
