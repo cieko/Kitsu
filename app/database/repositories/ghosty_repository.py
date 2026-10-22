@@ -77,6 +77,11 @@ async def initialize() -> None:
         ),
         asyncio.to_thread(
             gamble_history.create_index,
+            [("guild_id", 1), ("result_message_id", 1)],
+            unique=True,
+        ),
+        asyncio.to_thread(
+            gamble_history.create_index,
             [("guild_id", 1), ("channel_id", 1), ("created_at", 1)],
         ),
         asyncio.to_thread(

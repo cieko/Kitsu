@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 import time
 from collections import defaultdict
 from typing import Any
@@ -33,16 +34,19 @@ class GhostyCog(commands.Cog):
         self.bot = bot
         self.service = GhostyService(bot)
         self._initialized = False
-
+    
     async def cog_load(self) -> None:
         await self.service.initialize()
         self._initialized = True
+
+        self.bot.add_view(self._build_dashboard_controls_view())
 
         if not self.refresh_dashboard.is_running():
             self.refresh_dashboard.start()
 
     def cog_unload(self) -> None:
-        self.refresh_dashboard.cancel()
+        if self.refresh_dashboard.is_running():
+            self.refresh_dashboard.cancel()
 
     # ---------------------------------------------------------
     # Permission helpers
@@ -111,16 +115,41 @@ class GhostyCog(commands.Cog):
     ) -> discord.ui.LayoutView:
         """Build the paginated Ghosty dashboard using Components V2."""
         stats_documents = await repository.get_all_channel_stats(guild.id)
-        minimum_samples = int(await repository.get_config(
-            guild.id, "minimum_samples", DEFAULT_MINIMUM_SAMPLES
-        ))
+
+        excluded_channels = {
+            int(channel_id)
+            for channel_id in await repository.get_config(
+                guild.id,
+                "dashboard_excluded_channels",
+                [],
+            )
+        }
+
+        stats_documents = [
+            stats
+            for stats in stats_documents
+            if int(stats["channel_id"]) not in excluded_channels
+        ]
+
+        minimum_samples = int(
+            await repository.get_config(
+                guild.id,
+                "minimum_samples",
+                DEFAULT_MINIMUM_SAMPLES,
+            )
+        )
 
         rows: list[dict[str, Any]] = []
+
         for stats in stats_documents:
             channel_id = int(stats["channel_id"])
+
             prediction = await self.service.get_prediction_data(
-                guild.id, channel_id, minimum_samples=minimum_samples
+                guild.id,
+                channel_id,
+                minimum_samples=minimum_samples,
             )
+
             rows.append({
                 "channel_id": channel_id,
                 "streak": int(stats.get("streak", 0)),
@@ -130,41 +159,81 @@ class GhostyCog(commands.Cog):
                 "ready": bool(prediction.get("ready")),
             })
 
-        rows.sort(key=lambda row: (
-            not row["ready"],
-            row["hit_percent"] if row["ready"] and row["hit_percent"] is not None else float("inf"),
-            row["channel_id"],
-        ))
+        rows.sort(
+            key=lambda row: (
+                not row["ready"],
+                (
+                    row["hit_percent"]
+                    if row["ready"] and row["hit_percent"] is not None
+                    else float("inf")
+                ),
+                row["channel_id"],
+            )
+        )
 
         channels_per_page = 5
-        total_pages = max(1, (len(rows) + channels_per_page - 1) // channels_per_page)
+        total_pages = max(
+            1,
+            (len(rows) + channels_per_page - 1) // channels_per_page,
+        )
+
         if page is None:
-            page = int(await repository.get_config(guild.id, "dashboard_page", 0))
+            page = int(
+                await repository.get_config(
+                    guild.id,
+                    "dashboard_page",
+                    0,
+                )
+            )
+
         page = max(0, min(page, total_pages - 1))
-        await repository.set_config(guild.id, "dashboard_page", page)
-        page_rows = rows[page * channels_per_page:(page + 1) * channels_per_page]
+
+        await repository.set_config(
+            guild.id,
+            "dashboard_page",
+            page,
+        )
+
+        page_rows = rows[
+            page * channels_per_page:
+            (page + 1) * channels_per_page
+        ]
 
         def padded_label(value: str, width: int) -> str:
-            value = str(value)
-            if len(value) > width:
-                value = value[:max(1, width - 1)] + "…"
-            left = max(0, (width - len(value)) // 2)
-            right = max(0, width - len(value) - left)
-            return "\u2007" * left + value + "\u2007" * right
+                    value = str(value)
+        
+                    if len(value) > width:
+                        value = value[:max(1, width - 1)] + "…"
+        
+                    left = max(0, (width - len(value)) // 2)
+                    right = max(0, width - len(value) - left)
+        
+                    return "\u2007" * left + value + "\u2007" * right
 
         view = discord.ui.LayoutView(timeout=None)
-        container = discord.ui.Container(accent_colour=discord.Colour.dark_purple())
-        container.add_item(discord.ui.TextDisplay(content="### Ghosty Market"))
+
+        # ---------------------------------------------------------
+        # Section: Ghosty Market
+        # ---------------------------------------------------------
+
+        container = discord.ui.Container(
+            accent_colour=discord.Colour.dark_purple(),
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(content="### Ghosty Market")
+        )
 
         container.add_item(
             discord.ui.TextDisplay(
                 content=(
-                            "-# Channel Name   |   Streak   |   Loss   |   "
-                            "Hit @   |   % Of hitting"
-                        )
+                    "-# Channel Name   |   Streak   |   Loss   |   "
+                    "Hit @   |   % Of hitting"
+                )
             )
         )
 
+  
         if not rows:
             container.add_item(discord.ui.TextDisplay(
                 content="No confirmed Ghosty gambles have been recorded yet."
@@ -180,7 +249,7 @@ class GhostyCog(commands.Cog):
 
                 row_components = discord.ui.ActionRow()
                 row_components.add_item(discord.ui.Button(
-                    label=padded_label(channel_name, 12),
+                    label=padded_label(channel_name, 9),
                     style=discord.ButtonStyle.link,
                     url=channel_url,
                 ))
@@ -229,42 +298,617 @@ class GhostyCog(commands.Cog):
             navigation_row.add_item(next_button)
             container.add_item(navigation_row)
 
-        container.add_item(discord.ui.TextDisplay(
-            content=f"-# zᶻ Refresh <t:{int(time.time()) + DASHBOARD_REFRESH_SECONDS}:R>"
-        ))
+        container.add_item(
+            discord.ui.TextDisplay(
+                content=(
+                    f"-# zᶻ Refresh "
+                    f"<t:{int(time.time()) + DASHBOARD_REFRESH_SECONDS}:R>"
+                )
+            )
+        )
+
         view.add_item(container)
+
         return view
 
+    
+    def _build_dashboard_controls_view(self) -> discord.ui.LayoutView:
+        """Build persistent dashboard controls with interactive settings."""
+        view = discord.ui.LayoutView(timeout=None)
+
+        controls = discord.ui.Container(
+            accent_colour=discord.Colour.dark_purple(),
+        )
+
+        controls.add_item(
+            discord.ui.TextDisplay(
+                content=(
+                    "Track Ghosty gambling activity, explore channel statistics, "
+                    "andㅤ\nkeep up with recorded hits and streaks."
+                )
+            )
+        )
+
+        row = discord.ui.ActionRow()
+
+        terms_button = discord.ui.Button(
+            label="Terms of Service",
+            style=discord.ButtonStyle.secondary,
+            custom_id="ghosty:terms",
+        )
+
+        policy_button = discord.ui.Button(
+            label="Policy",
+            style=discord.ButtonStyle.secondary,
+            custom_id="ghosty:policy",
+        )
+
+        settings_button = discord.ui.Button(
+            label="⚙️",
+            style=discord.ButtonStyle.secondary,
+            custom_id="ghosty:settings",
+        )
+
+        async def show_terms(
+            interaction: discord.Interaction,
+        ) -> None:
+            panel = discord.ui.LayoutView(timeout=180)
+            container = discord.ui.Container(
+                accent_colour=discord.Colour.dark_purple(),
+            )
+
+            container.add_item(
+                discord.ui.TextDisplay(
+                    content=(
+                        "## Ghosty Dashboard — Terms of Service\n"
+                        "The Ghosty Dashboard is a community statistics tool "
+                        "that records detected gambling outcomes."
+                    )
+                )
+            )
+
+            container.add_item(
+                discord.ui.TextDisplay(
+                    content=(
+                        "**1. Informational use**\n"
+                        "Statistics and predictions are estimates based on "
+                        "recorded historical data. They are not guarantees "
+                        "of future outcomes.\n\n"
+                        "**2. Data accuracy**\n"
+                        "Results depend on accessible messages and successful "
+                        "gamble detection. Missing or incorrectly classified "
+                        "messages may affect the displayed statistics.\n\n"
+                        "**3. No guaranteed wins**\n"
+                        "A displayed streak or hit estimate does not guarantee "
+                        "that the next gamble will win.\n\n"
+                        "**4. Responsible use**\n"
+                        "Use the dashboard for informational purposes. "
+                        "Do not treat its estimates as a promise of profit."
+                    )
+                )
+            )
+
+            panel.add_item(container)
+
+            await interaction.response.send_message(
+                view=panel,
+                ephemeral=True,
+            )
+
+        async def show_policy(
+            interaction: discord.Interaction,
+        ) -> None:
+            panel = discord.ui.LayoutView(timeout=180)
+            container = discord.ui.Container(
+                accent_colour=discord.Colour.dark_purple(),
+            )
+
+            container.add_item(
+                discord.ui.TextDisplay(
+                    content="## Ghosty Dashboard — Tracking Policy"
+                )
+            )
+
+            container.add_item(
+                discord.ui.TextDisplay(
+                    content=(
+                        "**What is recorded?**\n"
+                        "Kitsu detects supported Ghosty wager commands and "
+                        "corresponding result messages to maintain channel "
+                        "statistics.\n\n"
+                        "**How are streaks calculated?**\n"
+                        "The current streak tracks consecutive recorded misses "
+                        "since the latest hit. Historical statistics depend "
+                        "on the results available to Kitsu.\n\n"
+                        "**What does Hit @ mean?**\n"
+                        "It represents the estimated hit position derived "
+                        "from recorded historical data and the bot's "
+                        "prediction logic.\n\n"
+                        "**What does the percentage mean?**\n"
+                        "It is the estimate produced by that prediction logic, "
+                        "not a guarantee or necessarily the true probability "
+                        "of the next gamble.\n\n"
+                        "**Channel exclusions**\n"
+                        "Excluded channels are hidden from the market display. "
+                        "Their historical records are not deleted."
+                    )
+                )
+            )
+
+            panel.add_item(container)
+
+            await interaction.response.send_message(
+                view=panel,
+                ephemeral=True,
+            )
+
+        async def show_settings(
+            interaction: discord.Interaction,
+        ) -> None:
+            guild = interaction.guild
+
+            if guild is None:
+                await interaction.response.send_message(
+                    "Use these settings inside a server.",
+                    ephemeral=True,
+                )
+                return
+
+            permissions = interaction.user.guild_permissions
+
+            if not (
+                permissions.administrator
+                or permissions.manage_guild
+            ):
+                await interaction.response.send_message(
+                    "You need Manage Server permission to change "
+                    "Ghosty dashboard settings.",
+                    ephemeral=True,
+                )
+                return
+
+            # Only include ordinary text channels that the bot can view.
+            bot_member = (
+                guild.get_member(self.bot.user.id)
+                if self.bot.user is not None
+                else None
+            )
+
+            channels = [
+                channel
+                for channel in guild.text_channels
+                if (
+                    bot_member is None
+                    or channel.permissions_for(bot_member).view_channel
+                )
+            ]
+
+            channels.sort(
+                key=lambda channel: (
+                    channel.position,
+                    channel.name.casefold(),
+                )
+            )
+
+            accessible_channel_ids = {
+                channel.id for channel in channels
+            }
+
+            existing_exclusions = await repository.get_config(
+                guild.id,
+                "dashboard_excluded_channels",
+                [],
+            )
+
+            # Preserve exclusions for channels that are no longer accessible.
+            excluded_channel_ids: set[int] = {
+                int(channel_id)
+                for channel_id in existing_exclusions
+            }
+
+            excluded_channel_ids.intersection_update(
+                excluded_channel_ids - accessible_channel_ids
+            )
+
+            # Keep the current exclusions for channels in this list.
+            excluded_channel_ids.update(
+                int(channel_id)
+                for channel_id in existing_exclusions
+                if int(channel_id) in accessible_channel_ids
+            )
+
+            channels_per_page = 10
+
+            total_pages = max(
+                1,
+                (
+                    len(channels) + channels_per_page - 1
+                ) // channels_per_page,
+            )
+
+            async def build_settings_view(
+                page: int,
+            ) -> discord.ui.LayoutView:
+                page = max(0, min(page, total_pages - 1))
+
+                settings_view = discord.ui.LayoutView(timeout=300)
+
+                settings_container = discord.ui.Container(
+                    accent_colour=discord.Colour.dark_purple(),
+                )
+
+                settings_container.add_item(
+                    discord.ui.TextDisplay(
+                        content=(
+                            "## Ghosty Market Settings\n"
+                            "Toggle each text channel to choose whether it "
+                            "appears on the market dashboard.\n\n"
+                            "✅ **Included** — shown on the dashboard\n"
+                            "🚫 **Excluded** — hidden from the dashboard\n\n"
+                            "These settings never delete historical records."
+                        )
+                    )
+                )
+
+                settings_container.add_item(
+                    discord.ui.Separator()
+                )
+
+                start_index = page * channels_per_page
+                page_channels = channels[
+                    start_index:start_index + channels_per_page
+                ]
+
+                if not channels:
+                    settings_container.add_item(
+                        discord.ui.TextDisplay(
+                            content=(
+                                "No accessible text channels were found."
+                            )
+                        )
+                    )
+
+                # Render up to five channel buttons per row.
+                for row_start in range(0, len(page_channels), 5):
+                    channel_row = discord.ui.ActionRow()
+
+                    for channel in page_channels[
+                        row_start:row_start + 5
+                    ]:
+                        is_excluded = (
+                            channel.id in excluded_channel_ids
+                        )
+
+                        marker = "🚫" if is_excluded else "✅"
+                        label = f"{marker} {channel.name}"[:80]
+
+                        channel_button = discord.ui.Button(
+                            label=label,
+                            style=(
+                                discord.ButtonStyle.danger
+                                if is_excluded
+                                else discord.ButtonStyle.success
+                            ),
+                            custom_id=(
+                                f"ghosty:settings:toggle:{channel.id}"
+                            ),
+                        )
+
+                        async def toggle_channel(
+                            button_interaction: discord.Interaction,
+                            channel_id: int = channel.id,
+                            current_page: int = page,
+                        ) -> None:
+                            if button_interaction.guild_id != guild.id:
+                                await button_interaction.response.send_message(
+                                    "This settings panel belongs to another server.",
+                                    ephemeral=True,
+                                )
+                                return
+
+                            if channel_id in excluded_channel_ids:
+                                excluded_channel_ids.remove(channel_id)
+                            else:
+                                excluded_channel_ids.add(channel_id)
+
+                            updated_view = await build_settings_view(
+                                current_page
+                            )
+
+                            await button_interaction.response.edit_message(
+                                view=updated_view
+                            )
+
+                        channel_button.callback = toggle_channel
+                        channel_row.add_item(channel_button)
+
+                    settings_container.add_item(channel_row)
+
+                settings_container.add_item(
+                    discord.ui.Separator()
+                )
+
+                navigation_row = discord.ui.ActionRow()
+
+                previous_button = discord.ui.Button(
+                    label="Previous",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=(page == 0),
+                )
+
+                page_indicator = discord.ui.Button(
+                    label=f"Page {page + 1}/{total_pages}",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=True,
+                )
+
+                next_button = discord.ui.Button(
+                    label="Next",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=(page >= total_pages - 1),
+                )
+
+                async def go_previous(
+                    page_interaction: discord.Interaction,
+                ) -> None:
+                    updated_view = await build_settings_view(page - 1)
+                    await page_interaction.response.edit_message(
+                        view=updated_view
+                    )
+
+                async def go_next(
+                    page_interaction: discord.Interaction,
+                ) -> None:
+                    updated_view = await build_settings_view(page + 1)
+                    await page_interaction.response.edit_message(
+                        view=updated_view
+                    )
+
+                previous_button.callback = go_previous
+                next_button.callback = go_next
+
+                navigation_row.add_item(previous_button)
+                navigation_row.add_item(page_indicator)
+                navigation_row.add_item(next_button)
+
+                settings_container.add_item(navigation_row)
+
+                actions_row = discord.ui.ActionRow()
+
+                save_button = discord.ui.Button(
+                    label="Save changes",
+                    style=discord.ButtonStyle.primary,
+                )
+
+                restore_button = discord.ui.Button(
+                    label="Restore all",
+                    style=discord.ButtonStyle.secondary,
+                )
+
+
+                async def save_exclusions(interaction: discord.Interaction) -> None:
+                    current_exclusions = {
+                        int(channel_id)
+                        for channel_id in await repository.get_config(
+                            guild.id,
+                            "dashboard_excluded_channels",
+                            [],
+                        )
+                    }
+
+                    accessible_channel_ids = {channel.id for channel in channels}
+
+                    # Preserve exclusions for channels that aren't currently accessible.
+                    inaccessible_exclusions = current_exclusions - accessible_channel_ids
+
+                    saved_exclusions = inaccessible_exclusions | (
+                        excluded_channel_ids & accessible_channel_ids
+                    )
+
+                    await repository.set_config(
+                        guild.id,
+                        "dashboard_excluded_channels",
+                        sorted(saved_exclusions),
+                    )
+
+                    # Acknowledge the interaction before performing other operations.
+                    await interaction.response.defer(ephemeral=True)
+
+                    # Delete the temporary settings panel.
+                    try:
+                        await interaction.delete_original_response()
+                    except (discord.NotFound, discord.HTTPException):
+                        pass
+
+                    # Show confirmation immediately after deleting the settings panel.
+                    await interaction.followup.send(
+                        (
+                            "Ghosty Market settings saved.\n"
+                            f"**Excluded channels:** {len(saved_exclusions)}\n"
+                            "The dashboard will refresh shortly. Historical records have not been changed."
+                        ),
+                        ephemeral=True,
+                    )
+
+                    # Give the confirmation a moment before rebuilding the dashboard.
+                    await asyncio.sleep(3)
+
+                    # Delete the old dashboard and controls, then post fresh messages.
+                    await self._repost_sticky_dashboard(guild)
+
+
+                async def restore_all(
+                    restore_interaction: discord.Interaction,
+                ) -> None:
+                    if restore_interaction.guild_id != guild.id:
+                        await restore_interaction.response.send_message(
+                            "This settings panel belongs to another server.",
+                            ephemeral=True,
+                        )
+                        return
+
+                    excluded_channel_ids.clear()
+
+                    await repository.set_config(
+                        guild.id,
+                        "dashboard_excluded_channels",
+                        [],
+                    )
+
+                    updated_view = await build_settings_view(page)
+
+                    await restore_interaction.response.edit_message(
+                        view=updated_view
+                    )
+
+                    await restore_interaction.followup.send(
+                        "All channels have been restored to the Ghosty Market. "
+                        "Historical records remain unchanged.",
+                        ephemeral=True,
+                    )
+
+                save_button.callback = save_exclusions
+                restore_button.callback = restore_all
+
+                actions_row.add_item(save_button)
+                actions_row.add_item(restore_button)
+
+                settings_container.add_item(actions_row)
+                settings_view.add_item(settings_container)
+
+                return settings_view
+
+            settings_view = await build_settings_view(0)
+
+            await interaction.response.send_message(
+                view=settings_view,
+                ephemeral=True,
+            )
+
+        terms_button.callback = show_terms
+        policy_button.callback = show_policy
+        settings_button.callback = show_settings
+
+        row.add_item(terms_button)
+        row.add_item(policy_button)
+        row.add_item(settings_button)
+
+        controls.add_item(row)
+        view.add_item(controls)
+
+        return view
+
+    
     async def _repost_sticky_dashboard(self, guild: discord.Guild) -> None:
-        """Move the dashboard to the bottom by reposting it after channel activity."""
-        channel_id = await repository.get_config(guild.id, "dashboard_channel_id")
-        old_message_id = await repository.get_config(guild.id, "dashboard_message_id")
+        """Repost both Ghosty dashboard messages together."""
+
+        # logger.warning(
+        #     "GHOSTY DASHBOARD REPOST TRIGGERED for guild %s",
+        #     guild.id,
+        #     stack_info=True,
+        # )
+        
+        channel_id = await repository.get_config(
+            guild.id,
+            "dashboard_channel_id",
+        )
+
+        old_market_id = await repository.get_config(
+            guild.id,
+            "dashboard_message_id",
+        )
+
+        old_controls_id = await repository.get_config(
+            guild.id,
+            "dashboard_controls_message_id",
+        )
+
+        old_tracker_id = await repository.get_config(
+            guild.id,
+            "dashboard_tracker_message_id",
+        )
+
         if not channel_id:
             return
 
         channel = guild.get_channel(int(channel_id))
+
         if not isinstance(channel, discord.TextChannel):
             return
 
-        old_message = None
-        if old_message_id:
-            old_message = await self._get_message(channel, int(old_message_id))
+        old_market = (
+            await self._get_message(channel, int(old_market_id))
+            if old_market_id
+            else None
+        )
 
-        view = await self._build_dashboard_view(guild)
+        old_controls = (
+            await self._get_message(channel, int(old_controls_id))
+            if old_controls_id
+            else None
+        )
+
+        old_tracker = (
+            await self._get_message(channel, int(old_tracker_id))
+            if old_tracker_id
+            else None
+        )
+
         try:
-            new_message = await channel.send(view=view)
+            tracker_message = await channel.send(
+                "## @ t r a c k e r"
+            )
+
+            market_view = await self._build_dashboard_view(guild)
+            controls_view = self._build_dashboard_controls_view()
+
+            # Send the market first, then the controls message.
+            new_market = await channel.send(view=market_view)
+            new_controls = await channel.send(view=controls_view)
+
         except discord.HTTPException:
-            logger.exception("Failed to repost Ghosty dashboard in guild %s.", guild.id)
+            logger.exception(
+                "Failed to repost Ghosty dashboard pair in guild %s.",
+                guild.id,
+            )
             return
 
-        await repository.set_config(guild.id, "dashboard_message_id", str(new_message.id))
+        await repository.set_config(
+            guild.id,
+            "dashboard_message_id",
+            str(new_market.id),
+        )
 
-        if old_message is not None:
+        await repository.set_config(
+            guild.id,
+            "dashboard_controls_message_id",
+            str(new_controls.id),
+        )
+
+        await repository.set_config(
+            guild.id,
+            "dashboard_tracker_message_id",
+            str(tracker_message.id),
+        )
+
+        # Delete old messages only after both replacements were sent.
+        for old_message in (old_tracker, old_market, old_controls):
+            if old_message is None:
+                continue
+
             try:
                 await old_message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                logger.warning("Could not delete old Ghosty dashboard message %s.", old_message.id)
-
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException,
+            ):
+                logger.warning(
+                    "Could not delete old Ghosty dashboard message %s.",
+                    old_message.id,
+                )
+    
+    
     async def _refresh_dashboard_for_guild(
         self,
         guild: discord.Guild,
@@ -274,11 +918,6 @@ class GhostyCog(commands.Cog):
             "dashboard_channel_id",
         )
 
-        message_id = await repository.get_config(
-            guild.id,
-            "dashboard_message_id",
-        )
-
         if not channel_id:
             return
 
@@ -287,51 +926,134 @@ class GhostyCog(commands.Cog):
         if not isinstance(channel, discord.TextChannel):
             return
 
-        view = await self._build_dashboard_view(guild)
-
-        if message_id:
-            message = await self._get_message(
-                channel,
-                int(message_id),
-            )
-
-            if message is not None:
-                # A legacy dashboard message contains normal message content and
-                # cannot reliably be converted into a Components V2 message by
-                # merely attaching a LayoutView. Delete it and create a fresh V2
-                # message once, then future refreshes can edit that V2 message.
-                is_components_v2 = bool(
-                    getattr(message.flags, "is_components_v2", False)
-                )
-                if is_components_v2:
-                    try:
-                        await message.edit(view=view, content=None, embeds=[])
-                        return
-                    except discord.HTTPException:
-                        logger.exception("Failed to edit Ghosty V2 dashboard.")
-                else:
-                    try:
-                        await message.delete()
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                        logger.warning(
-                            "Could not delete legacy Ghosty dashboard message %s.",
-                            message.id,
-                        )
-
-        try:
-            message = await channel.send(view=view)
-        except discord.HTTPException:
-            logger.exception(
-                "Failed to create Ghosty dashboard."
-            )
-            return
-
-        await repository.set_config(
+        market_id = await repository.get_config(
             guild.id,
             "dashboard_message_id",
-            str(message.id),
         )
 
+        controls_id = await repository.get_config(
+            guild.id,
+            "dashboard_controls_message_id",
+        )
+
+        tracker_id = await repository.get_config(
+            guild.id,
+            "dashboard_tracker_message_id",
+        )
+
+        market_message = (
+            await self._get_message(channel, int(market_id))
+            if market_id
+            else None
+        )
+
+        controls_message = (
+            await self._get_message(channel, int(controls_id))
+            if controls_id
+            else None
+        )
+
+        tracker_message = (
+            await self._get_message(channel, int(tracker_id))
+            if tracker_id
+            else None
+        )
+
+        # Recreate the pair if either message is missing or is not V2.
+        pair_is_valid = (
+            tracker_message is not None
+            and market_message is not None
+            and controls_message is not None
+            and bool(market_message.flags.components_v2)
+            and bool(controls_message.flags.components_v2)
+        )
+
+        # logger.info(
+        #     "Ghosty dashboard refresh: guild=%s, market_found=%s, "
+        #     "controls_found=%s, market_v2=%s, controls_v2=%s",
+        #     guild.id,
+        #     market_message is not None,
+        #     controls_message is not None,
+        #     market_message.flags.components_v2 if market_message else None,
+        #     controls_message.flags.components_v2 if controls_message else None,
+        # )
+
+        if not pair_is_valid:
+            market_view = await self._build_dashboard_view(guild)
+            controls_view = self._build_dashboard_controls_view()
+
+            try:
+                new_tracker = await channel.send(
+                    "## @ t r a c k e r"
+                )
+                new_market = await channel.send(view=market_view)
+                new_controls = await channel.send(view=controls_view)
+            except discord.HTTPException:
+                logger.exception(
+                    "Failed to create Ghosty dashboard pair for guild %s.",
+                    guild.id,
+                )
+                return
+
+            await repository.set_config(
+                guild.id,
+                "dashboard_message_id",
+                str(new_market.id),
+            )
+
+            await repository.set_config(
+                guild.id,
+                "dashboard_controls_message_id",
+                str(new_controls.id),
+            )
+
+            await repository.set_config(
+                guild.id,
+                "dashboard_tracker_message_id",
+                str(new_tracker.id),
+            )
+
+            # Remove the old pair after both replacements have been sent.
+            for old_message in (tracker_message, market_message, controls_message):
+                if old_message is None:
+                    continue
+
+                try:
+                    await old_message.delete()
+                except (
+                    discord.NotFound,
+                    discord.Forbidden,
+                    discord.HTTPException,
+                ):
+                    logger.warning(
+                        "Could not delete old Ghosty dashboard message %s.",
+                        old_message.id,
+                    )
+
+            return
+
+        # Both messages exist: refresh the market and maintain the controls.
+        market_view = await self._build_dashboard_view(guild)
+        controls_view = self._build_dashboard_controls_view()
+
+        try:
+            await market_message.edit(
+                view=market_view,
+                content=None,
+                embeds=[],
+            )
+
+            await controls_message.edit(
+                view=controls_view,
+                content=None,
+                embeds=[],
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to refresh Ghosty dashboard pair for guild %s.",
+                guild.id,
+            )
+    
     @tasks.loop(seconds=DASHBOARD_REFRESH_SECONDS)
     async def refresh_dashboard(self) -> None:
         for guild in self.bot.guilds:
@@ -353,36 +1075,34 @@ class GhostyCog(commands.Cog):
 
     async def _get_streak_participant_ids(
         self,
-        source_message: discord.Message,
+        guild_id: int,
+        channel_id: int,
+        result_message_id: int,
         hit_user_id: int,
     ) -> list[int]:
-        """Collect users whose misses belong to the current channel streak."""
+        """Collect losing users from the recorded streak that just ended."""
+        history = await repository.get_gamble_history(
+            guild_id,
+            channel_id,
+            limit=None,
+        )
         participant_ids: set[int] = set()
-        pending_result: discord.Message | None = None
-        try:
-            async for previous in source_message.channel.history(
-                limit=1000, before=source_message, oldest_first=False
-            ):
-                if previous.author.id == GHOSTY_BOT_ID:
-                    if pending_result is None:
-                        pending_result = previous
-                    continue
+        found_current_hit = False
 
-                if pending_result is None or detect_gamble(previous) is None:
-                    continue
+        for entry in reversed(history):
+            if not found_current_hit:
+                if str(entry.get("result_message_id")) == str(result_message_id):
+                    found_current_hit = True
+                continue
 
-                matched = await self.service.analyze_messages(previous, pending_result)
-                pending_result = None
-                if matched is None:
-                    continue
-                if matched["outcome"] == "hit":
-                    break
-                participant_ids.add(previous.author.id)
-        except (discord.Forbidden, discord.HTTPException):
-            logger.exception(
-                "Could not collect Ghosty streak participants for message %s.",
-                source_message.id,
-            )
+            # Stop at the previous hit: only the consecutive misses before the
+            # current hit belong to the streak being announced.
+            if entry.get("outcome") == "hit":
+                break
+            if entry.get("outcome") == "miss":
+                user_id = int(entry.get("user_id", 0))
+                if user_id > 0:
+                    participant_ids.add(user_id)
 
         participant_ids.discard(hit_user_id)
         return sorted(participant_ids)
@@ -425,15 +1145,13 @@ class GhostyCog(commands.Cog):
                         if not isinstance(notification_channel, discord.TextChannel):
                             notification_channel = source_channel
 
-                        source_message = await self._get_message(
-                            message.channel, int(recorded["source_message_id"])
+                        hit_user_id = int(recorded.get("user_id", 0))
+                        participant_ids = await self._get_streak_participant_ids(
+                            guild_id,
+                            source_channel_id,
+                            int(recorded["result_message_id"]),
+                            hit_user_id,
                         )
-                        hit_user_id = int(recorded["user_id"])
-                        participant_ids: list[int] = []
-                        if source_message is not None:
-                            participant_ids = await self._get_streak_participant_ids(
-                                source_message, hit_user_id
-                            )
 
                         if isinstance(notification_channel, discord.TextChannel):
                             channel_label = (
@@ -465,7 +1183,7 @@ class GhostyCog(commands.Cog):
                             content = (
                                 f"{first_line}\n"
                                 f"🎉  **A Ghosty hit has been recorded!** "
-                                f"Kudos to <@{hit_user_id}>\n"
+                                f"{('Kudos to <@' + str(hit_user_id) + '>') if hit_user_id > 0 else 'A winning hit was detected'}\n"
                                 f"{stats_line}\n"
                                 f"-# [Jump to message]({message.jump_url})"
                             )
@@ -491,7 +1209,8 @@ class GhostyCog(commands.Cog):
                                     allowed_mentions=discord.AllowedMentions.none(),
                                 )
 
-                            await self._repost_sticky_dashboard(guild)
+                            # await self._repost_sticky_dashboard(guild)
+                            await self._refresh_dashboard_for_guild(guild)
                             dashboard_repositioned = (
                                 notification_channel.id == dashboard_channel_id_int
                             )
@@ -519,7 +1238,8 @@ class GhostyCog(commands.Cog):
             and message.channel.id == dashboard_channel_id_int
         ):
             try:
-                await self._repost_sticky_dashboard(guild)
+                # await self._repost_sticky_dashboard(guild)
+                await self._refresh_dashboard_for_guild(guild)
             except Exception:
                 logger.exception(
                     "Failed to reposition Ghosty dashboard after message %s.",
@@ -530,6 +1250,7 @@ class GhostyCog(commands.Cog):
     # /ghosty setup
     # ---------------------------------------------------------
 
+    
     @ghosty.command(
         name="setup",
         description="Choose the channel for the Ghosty dashboard.",
@@ -543,65 +1264,120 @@ class GhostyCog(commands.Cog):
         if not await self._require_admin(interaction):
             return
 
+        guild = interaction.guild
+        if guild is None:
+            return
+
         await interaction.response.defer(
             ephemeral=True,
             thinking=True,
         )
 
-        # Remove the previously configured dashboard before replacing it.
-        # This also cleans up the old plain-text/legacy-embed dashboard when
-        # /ghosty setup is run again, including when moving to another channel.
         old_channel_id = await repository.get_config(
-            interaction.guild.id,
+            guild.id,
             "dashboard_channel_id",
         )
-        old_message_id = await repository.get_config(
-            interaction.guild.id,
+
+        old_market_id = await repository.get_config(
+            guild.id,
             "dashboard_message_id",
         )
-        if old_channel_id and old_message_id:
-            old_channel = interaction.guild.get_channel(int(old_channel_id))
+
+        old_controls_id = await repository.get_config(
+            guild.id,
+            "dashboard_controls_message_id",
+        )
+
+        old_tracker_id = await repository.get_config(
+            guild.id,
+            "dashboard_tracker_message_id",
+        )
+
+        # Clean up both messages from the previous setup.
+        if old_channel_id:
+            old_channel = guild.get_channel(int(old_channel_id))
+
             if isinstance(old_channel, discord.TextChannel):
-                old_message = await self._get_message(
-                    old_channel,
-                    int(old_message_id),
-                )
-                if old_message is not None:
+                for old_id in (old_tracker_id, old_market_id, old_controls_id):
+                    if not old_id:
+                        continue
+
+                    old_message = await self._get_message(
+                        old_channel,
+                        int(old_id),
+                    )
+
+                    if old_message is None:
+                        continue
+
                     try:
                         await old_message.delete()
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    except (
+                        discord.NotFound,
+                        discord.Forbidden,
+                        discord.HTTPException,
+                    ):
                         logger.warning(
-                            "Could not delete previous Ghosty dashboard message %s.",
+                            "Could not delete previous Ghosty dashboard "
+                            "message %s.",
                             old_message.id,
                         )
 
         await repository.set_config(
-            interaction.guild.id,
+            guild.id,
             "dashboard_channel_id",
             str(channel.id),
         )
 
         try:
-            view = await self._build_dashboard_view(interaction.guild)
-            message = await channel.send(view=view)
+            tracker_message = await channel.send(
+                "## @ t r a c k e r"
+            )
+
+            market_view = await self._build_dashboard_view(guild)
+            controls_view = self._build_dashboard_controls_view()
+
+            # Always send the market message first.
+            market_message = await channel.send(view=market_view)
+            controls_message = await channel.send(view=controls_view)
+
         except discord.HTTPException:
+            logger.exception(
+                "Failed to set up Ghosty dashboard pair in guild %s.",
+                guild.id,
+            )
+
             await interaction.followup.send(
-                "I couldn't post the dashboard there. Check that I have "
-                "View Channel and Send Messages permissions.",
+                "I couldn't post both dashboard messages there. Check that "
+                "I have View Channel, Send Messages, and Read Message History "
+                "permissions. Run `/ghosty setup` again after fixing permissions.",
                 ephemeral=True,
             )
             return
 
         await repository.set_config(
-            interaction.guild.id,
+            guild.id,
             "dashboard_message_id",
-            str(message.id),
+            str(market_message.id),
+        )
+
+        await repository.set_config(
+            guild.id,
+            "dashboard_controls_message_id",
+            str(controls_message.id),
+        )
+
+        await repository.set_config(
+            guild.id,
+            "dashboard_controls_message_id",
+            str(controls_message.id),
         )
 
         await interaction.followup.send(
-            f"Ghosty dashboard configured in {channel.mention}.",
+            f"Ghosty dashboard and controls configured in {channel.mention}.",
             ephemeral=True,
         )
+        
 
     # ---------------------------------------------------------
     # /ghosty test
@@ -657,9 +1433,7 @@ class GhostyCog(commands.Cog):
             )
             return
 
-        candidates = [source]
         matched_result = None
-        ambiguous = False
 
         try:
             async for candidate in interaction.channel.history(
@@ -667,64 +1441,36 @@ class GhostyCog(commands.Cog):
                 after=source,
                 oldest_first=True,
             ):
-                if candidate.author.id == GHOSTY_BOT_ID:
-                    matches = []
+                if candidate.author.id != GHOSTY_BOT_ID:
+                    continue
 
-                    for gamble in candidates:
-                        result = await self.service.analyze_messages(
-                            gamble,
-                            candidate,
-                        )
-
-                        if result is not None:
-                            matches.append(
-                                (gamble, result, candidate)
-                            )
-
-                    if len(matches) == 1:
-                        matched_result = matches[0]
-                    elif len(matches) > 1:
-                        ambiguous = True
-
+                result = await self.service.analyze_result_message(candidate, source)
+                if result is not None:
+                    matched_result = (result, candidate)
                     break
-
-                if detect_gamble(candidate) is not None:
-                    candidates.append(candidate)
 
         except (discord.Forbidden, discord.HTTPException):
             await interaction.followup.send(
-                f"Detected wager: **{wager:,} Goos**.\n"
-                "I couldn't scan the messages after this gamble. "
-                "Check my View Channel and Read Message History permissions.",
+                f"Detected wager command: **{wager:,} Goos**.\n"
+                "I couldn't scan the messages after it. Check my View Channel "
+                "and Read Message History permissions.",
                 ephemeral=True,
             )
             return
 
-        if ambiguous:
+        if matched_result is None:
             await interaction.followup.send(
-                f"Detected wager: **{wager:,} Goos**.\n"
-                "The Ghosty result could match multiple gamble commands. "
+                f"Detected wager command: **{wager:,} Goos**.\n"
+                "No valid Ghosty gambling response was found after this message. "
+                "Other Ghosty messages, including balance replies, are ignored. "
                 "No stats were changed.",
                 ephemeral=True,
             )
             return
 
-        if (
-            matched_result is None
-            or matched_result[0].id != source.id
-        ):
-            await interaction.followup.send(
-                f"Detected wager: **{wager:,} Goos**.\n"
-                "No confidently matched Ghosty result was found for this "
-                "gamble before the next Ghosty message. No stats were changed.",
-                ephemeral=True,
-            )
-            return
-
-        _, result, response = matched_result
-
+        result, response = matched_result
         await interaction.followup.send(
-            f"**Wager:** {result['wager']:,} Goos\n"
+            f"**Response wager:** {result['wager']:,} Goos\n"
             f"**Ghosty message:** [Jump to message]({response.jump_url})\n"
             f"**Classification:** {result['outcome'].upper()}\n"
             f"**Payout:** {result['payout']:,} Goos\n"
@@ -868,7 +1614,7 @@ class GhostyCog(commands.Cog):
 
     @ghosty.command(
         name="backfill",
-        description="Scan accessible channel history for Ghosty gambles.",
+        description="Scan accessible channel history for Ghosty gambling results.",
     )
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
@@ -888,7 +1634,7 @@ class GhostyCog(commands.Cog):
         if guild is None:
             return
 
-        # Prevent historical imports from interleaving with live records.
+        # Never mix a historical import with live records or active tracking.
         if import_results:
             if await self.service.is_live_enabled(guild.id):
                 await interaction.response.send_message(
@@ -897,318 +1643,148 @@ class GhostyCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-
             if await repository.has_live_gambles(guild.id):
                 await interaction.response.send_message(
                     "Backfill import is blocked because live results already "
-                    "exist in the database. Importing older results now could "
-                    "corrupt chronological streak statistics.",
+                    "exist in the database. No records were changed.",
+                    ephemeral=True,
+                )
+                return
+            if confirmation != BACKFILL_IMPORT_CONFIRMATION:
+                await interaction.response.send_message(
+                    "To import results, set import_results to True and "
+                    "confirmation to IMPORT. Otherwise, run a dry run.",
                     ephemeral=True,
                 )
                 return
 
-        if (
-            import_results
-            and confirmation != BACKFILL_IMPORT_CONFIRMATION
-        ):
-            await interaction.response.send_message(
-                "To import results, set import_results to True and "
-                "confirmation to IMPORT. Otherwise, run a dry run.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(
-            ephemeral=True,
-            thinking=True,
-        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         counts = defaultdict(int)
-
-        inaccessible = 0
         scanned = 0
         channels_completed = 0
-        channels_failed = 0
+        inaccessible = 0
         total_wagers_detected = 0
         total_ghosty_messages = 0
 
         for channel in guild.text_channels:
-            # Pending wager commands, maintained in chronological order.
             pending_gambles: list[discord.Message] = []
-
             channel_scanned = 0
             channel_wagers = 0
             channel_ghosty = 0
-            channel_hits = 0
-            channel_misses = 0
-            channel_ignored = 0
-            channel_unmatched = 0
-            channel_duplicates = 0
-            channel_imported = 0
-
-            logger.info(
-                "Ghosty backfill starting channel=%s (%s)",
-                channel.name,
-                channel.id,
-            )
 
             try:
                 async for message in channel.history(limit=None, oldest_first=True):
                     scanned += 1
                     channel_scanned += 1
 
-                    # Collect supported wager commands.
                     wager = detect_gamble(message)
-
                     if wager is not None:
                         channel_wagers += 1
                         pending_gambles.append(message)
-
-                        logger.debug(
-                            "Ghosty backfill wager detected: "
-                            "channel=%s channel_id=%s message_id=%s "
-                            "author_id=%s wager=%s content=%r",
-                            channel.name,
-                            channel.id,
-                            message.id,
-                            message.author.id,
-                            wager,
-                            message.content[:200],
-                        )
                         continue
 
-                    # Ignore messages that are not from Ghosty.
                     if message.author.id != GHOSTY_BOT_ID:
                         continue
 
                     channel_ghosty += 1
-
-                    if not pending_gambles:
-                        counts["ghosty_without_wager"] += 1
-                        logger.debug(
-                            "Ghosty response without pending wager: "
-                            "channel=%s channel_id=%s message_id=%s "
-                            "content=%r",
-                            channel.name,
-                            channel.id,
-                            message.id,
-                            message.content[:200],
-                        )
-                        continue
-
-                    # Try pending wagers from newest to oldest.
-                    # If several wagers have the same amount, prefer the
-                    # latest command rather than marking the response ambiguous.
-                    matched_result = None
-                    matched_source = None
-
-                    for source_message in reversed(pending_gambles):
-                        result = await self.service.analyze_messages(
-                            source_message,
-                            message,
-                        )
-
-                        if result is not None:
-                            matched_result = result
-                            matched_source = source_message
-                            break
-
-                    if matched_result is None or matched_source is None:
-                        channel_ignored += 1
+                    result = await self.service.analyze_result_message(
+                        message,
+                        pending_gambles[-1] if pending_gambles else None,
+                    )
+                    if result is None:
                         counts["ignored"] += 1
-
-                        logger.warning(
-                            "Ghosty backfill could not classify response: "
-                            "channel=%s channel_id=%s response_id=%s "
-                            "pending_wagers=%s content=%r",
-                            channel.name,
-                            channel.id,
-                            message.id,
-                            len(pending_gambles),
-                            message.content[:200],
-                        )
-
-                        # Do not discard the entire pending list just because
-                        # this response was not recognized.
                         continue
 
-                    result = matched_result
                     outcome = result["outcome"]
-
                     counts[outcome] += 1
 
-                    if outcome == "hit":
-                        channel_hits += 1
-                    else:
-                        channel_misses += 1
-
-                    logger.info(
-                        "Ghosty backfill classified result: "
-                        "channel=%s channel_id=%s outcome=%s "
-                        "wager=%s payout=%s source_id=%s result_id=%s "
-                        "user_id=%s",
-                        channel.name,
-                        channel.id,
-                        outcome,
-                        result.get("wager"),
-                        result.get("payout"),
-                        result.get("source_message_id"),
-                        result.get("result_message_id"),
-                        result.get("user_id"),
+                    # Compare the actual Ghosty response ID with existing history.
+                    # This is a read-only duplicate check.
+                    existing_record = await repository.get_gamble_by_result_message(
+                        guild.id,
+                        message.id,
                     )
 
-                    # Import only when explicitly requested.
+                    if existing_record is not None:
+                        counts["duplicates"] += 1
+                    else:
+                        counts["new_candidates"] += 1
+
+                    # Pending commands are attribution candidates only.
+                    pending_gambles.clear()
+
+                    logger.info(
+                        "Ghosty backfill response classified: guild=%s channel=%s "
+                        "response_id=%s outcome=%s wager=%s payout=%s user_id=%s",
+                        guild.id,
+                        channel.id,
+                        message.id,
+                        outcome,
+                        result["wager"],
+                        result["payout"],
+                        result["user_id"],
+                    )
+
                     if import_results:
                         recorded = await self.service.record_result(
                             result,
                             source="backfill",
                         )
-
                         if recorded is None:
                             counts["duplicates"] += 1
-                            channel_duplicates += 1
-
-                            logger.info(
-                                "Ghosty backfill duplicate skipped: "
-                                "channel=%s channel_id=%s source_id=%s",
-                                channel.name,
-                                channel.id,
-                                result.get("source_message_id"),
-                            )
                         else:
                             counts["imported"] += 1
-                            channel_imported += 1
 
-                    # Remove wagers up to and including the matched wager.
-                    # Older unmatched commands must not be paired with a
-                    # later Ghosty response accidentally.
-                    matched_index = pending_gambles.index(matched_source)
-                    removed = pending_gambles[:matched_index + 1]
-                    del pending_gambles[:matched_index + 1]
-
-                    # Commands discarded before the matched one did not
-                    # receive a confidently matched result.
-                    if len(removed) > 1:
-                        unmatched_count = len(removed) - 1
-                        channel_unmatched += unmatched_count
-                        counts["unmatched"] += unmatched_count
-
-                        logger.warning(
-                            "Ghosty backfill discarded older unmatched "
-                            "wagers: channel=%s channel_id=%s count=%s "
-                            "message_ids=%s",
-                            channel.name,
-                            channel.id,
-                            unmatched_count,
-                            [item.id for item in removed[:-1]],
-                        )
-
-                # Count wager commands left without a matching response.
-                if pending_gambles:
-                    remaining = len(pending_gambles)
-                    channel_unmatched += remaining
-                    counts["unmatched"] += remaining
-
-                    logger.warning(
-                        "Ghosty backfill unmatched wagers at end of channel: "
-                        "channel=%s channel_id=%s count=%s message_ids=%s",
-                        channel.name,
-                        channel.id,
-                        remaining,
-                        [item.id for item in pending_gambles],
-                    )
-
+                # Commands are not required to have a one-to-one Ghosty reply.
+                # Keep a count for visibility, but don't call them unmatched.
                 channels_completed += 1
                 total_wagers_detected += channel_wagers
                 total_ghosty_messages += channel_ghosty
-
                 logger.info(
-                    "Ghosty backfill channel summary: "
-                    "channel=%s channel_id=%s scanned=%s "
-                    "wagers_detected=%s ghosty_messages=%s "
-                    "hits=%s misses=%s ignored=%s unmatched=%s "
-                    "duplicates=%s imported=%s",
+                    "Ghosty backfill channel summary: channel=%s (%s) "
+                    "scanned=%s wagers=%s ghosty_messages=%s hits=%s misses=%s ignored=%s",
                     channel.name,
                     channel.id,
                     channel_scanned,
                     channel_wagers,
                     channel_ghosty,
-                    channel_hits,
-                    channel_misses,
-                    channel_ignored,
-                    channel_unmatched,
-                    channel_duplicates,
-                    channel_imported,
+                    counts["hit"],
+                    counts["miss"],
+                    counts["ignored"],
                 )
 
-            except discord.Forbidden:
+            except (discord.Forbidden, discord.HTTPException) as exc:
                 inaccessible += 1
-                channels_failed += 1
-
-                if pending_gambles:
-                    remaining = len(pending_gambles)
-                    channel_unmatched += remaining
-                    counts["unmatched"] += remaining
-
                 logger.warning(
-                    "Ghosty backfill skipped channel=%s (%s) | "
-                    "reason=Missing Access | messages_scanned=%s",
+                    "Ghosty backfill skipped channel=%s (%s): %s",
                     channel.name,
                     channel.id,
-                    channel_scanned,
+                    getattr(exc, "status", "Missing Access"),
                 )
-
-                total_wagers_detected += channel_wagers
-                total_ghosty_messages += channel_ghosty
-
-            except discord.HTTPException as exc:
-                inaccessible += 1
-                channels_failed += 1
-
-                if pending_gambles:
-                    remaining = len(pending_gambles)
-                    channel_unmatched += remaining
-                    counts["unmatched"] += remaining
-
-                logger.warning(
-                    "Ghosty backfill skipped channel=%s (%s) | "
-                    "reason=Discord HTTP error (%s) | messages_scanned=%s",
-                    channel.name,
-                    channel.id,
-                    exc.status,
-                    channel_scanned,
-                )
-
                 total_wagers_detected += channel_wagers
                 total_ghosty_messages += channel_ghosty
 
         mode = "IMPORT" if import_results else "DRY RUN"
-
         logger.info(
-            "Ghosty backfill final summary: "
-            "mode=%s guild=%s guild_id=%s "
+            "Ghosty backfill final summary: mode=%s guild=%s guild_id=%s "
             "channels_total=%s channels_completed=%s channels_failed=%s "
-            "messages_scanned=%s wagers_detected=%s ghosty_messages=%s "
-            "hits=%s misses=%s ignored=%s unmatched=%s "
-            "ghosty_without_wager=%s duplicates=%s imported=%s "
-            "inaccessible=%s",
+            "messages_scanned=%s wagers_detected=%s ghosty_messages=%s hits=%s misses=%s "
+            "ignored=%s duplicates=%s imported=%s",
             mode,
             guild.name,
             guild.id,
             len(guild.text_channels),
             channels_completed,
-            channels_failed,
+            inaccessible,
             scanned,
             total_wagers_detected,
             total_ghosty_messages,
             counts["hit"],
             counts["miss"],
             counts["ignored"],
-            counts["unmatched"],
-            counts["ghosty_without_wager"],
             counts["duplicates"],
             counts["imported"],
-            inaccessible,
         )
 
         await interaction.followup.send(
@@ -1221,13 +1797,11 @@ class GhostyCog(commands.Cog):
             f"Ghosty messages found: **{total_ghosty_messages:,}**\n"
             f"Validated hits: **{counts['hit']:,}**\n"
             f"Validated misses: **{counts['miss']:,}**\n"
-            f"Ignored/ambiguous results: **{counts['ignored']:,}**\n"
-            f"Unmatched wager commands: **{counts['unmatched']:,}**\n"
-            f"Ghosty messages without pending wagers: "
-            f"**{counts['ghosty_without_wager']:,}**\n"
+            f"Ignored/non-gambling Ghosty messages: **{counts['ignored']:,}**\n"
             f"Already recorded: **{counts['duplicates']:,}**\n"
+            f"New historical candidates: **{counts['new_candidates']:,}**\n"
             f"Newly imported: **{counts['imported']:,}**\n\n"
-            "Per-channel details are available in the bot's logs.",
+            "Per-channel details are available in the bot logs.",
             ephemeral=True,
         )
 
