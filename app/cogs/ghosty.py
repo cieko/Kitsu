@@ -5,16 +5,26 @@ import asyncio
 import time
 from collections import defaultdict
 from typing import Any
+from datetime import datetime
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from app.database.repositories import ghosty_repository as repository
 from app.services.ghosty_service import (
     GHOSTY_BOT_ID,
     GhostyService,
     detect_gamble,
+)
+from app.services.ghosty_tempchannel_service import (
+    GhostyTempChannelService,
+    TempChannelError,
+    DURATION_PRESETS,
+)
+from app.services.emoji_services import get_application_emoji
+from app.database.repositories import (
+    ghosty_repository as repository,
+    ghosty_tempchannel_repository as tempchannel_repository,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,19 +34,462 @@ DASHBOARD_REFRESH_SECONDS = 60
 BACKFILL_IMPORT_CONFIRMATION = "IMPORT"
 
 
+class GhostyTempChannelSettingsView(discord.ui.View):
+    """Interactive settings panel for a Ghosty temporary-channel owner."""
+
+    def __init__(
+        self,
+        cog: "GhostyCog",
+        owner_id: int,
+        channel_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.channel_id = channel_id
+
+        # UserSelect is a class, not a @discord.ui.user_select decorator.
+        self.add_item(self.AddMemberSelect(self))
+        self.add_item(self.RemoveMemberSelect(self))
+
+    @property
+    def channel(self) -> discord.TextChannel | None:
+        """Return the original channel if it is still available."""
+        channel = self.cog.bot.get_channel(self.channel_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+        return None
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the owner of this temporary channel can use these controls.",
+                ephemeral=True,
+            )
+            return False
+
+        if (
+            interaction.guild is None
+            or interaction.channel_id != self.channel_id
+            or not isinstance(interaction.user, discord.Member)
+            or not isinstance(interaction.channel, discord.TextChannel)
+        ):
+            await interaction.response.send_message(
+                "Use this panel in its original temporary channel.",
+                ephemeral=True,
+            )
+            return False
+
+        try:
+            await self.cog.tempchannel_service._get_owned_channel(
+                interaction.user,
+                interaction.channel,
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc),
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    @discord.ui.select(
+        placeholder="Change visibility...",
+        row=0,
+        options=[
+            discord.SelectOption(
+                label="Public",
+                value="public",
+                description="Allow everyone to view the channel.",
+            ),
+            discord.SelectOption(
+                label="Private",
+                value="private",
+                description="Restrict access to the owner and allowed members.",
+            ),
+        ],
+    )
+    async def visibility_select(
+        self,
+        interaction: discord.Interaction,
+        select: discord.ui.Select,
+    ) -> None:
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This action must be used inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "This is not a text channel.",
+                ephemeral=True,
+            )
+            return
+
+        visibility = select.values[0]
+
+        try:
+            await self.cog.tempchannel_service.set_visibility(
+                interaction.user,
+                interaction.channel,
+                visibility,
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc),
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "Discord could not update the channel permissions.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Channel visibility changed to **{visibility}**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.select(
+        placeholder="Extend channel duration...",
+        row=1,
+        options=[
+            discord.SelectOption(label="1 hour", value="1h"),
+            discord.SelectOption(label="2 hours", value="2h"),
+            discord.SelectOption(label="6 hours", value="6h"),
+            discord.SelectOption(label="12 hours", value="12h"),
+            discord.SelectOption(label="1 day", value="1d"),
+            discord.SelectOption(label="3 days", value="3d"),
+            discord.SelectOption(label="7 days", value="7d"),
+        ],
+    )
+    async def duration_select(
+        self,
+        interaction: discord.Interaction,
+        select: discord.ui.Select,
+    ) -> None:
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This action must be used inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "This is not a text channel.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            expires_at = await self.cog.tempchannel_service.extend_channel(
+                interaction.user,
+                interaction.channel,
+                select.values[0],
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc),
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "Discord could not extend the channel duration.",
+                ephemeral=True,
+            )
+            return
+
+        timestamp = int(expires_at.timestamp())
+        await interaction.response.send_message(
+            f"Channel expiry updated to <t:{timestamp}:F> "
+            f"(<t:{timestamp}:R>).",
+            ephemeral=True,
+        )
+
+    class AddMemberSelect(discord.ui.UserSelect):
+        """Select a server member to add to the temporary channel."""
+
+        def __init__(
+            self,
+            settings_view: "GhostyTempChannelSettingsView",
+        ) -> None:
+            self.settings_view = settings_view
+            super().__init__(
+                placeholder="Select a member to add...",
+                min_values=1,
+                max_values=1,
+                row=2,
+            )
+
+        async def callback(
+            self,
+            interaction: discord.Interaction,
+        ) -> None:
+            view = self.settings_view
+
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message(
+                    "This action must be used inside the server.",
+                    ephemeral=True,
+                )
+                return
+
+            if not isinstance(interaction.channel, discord.TextChannel):
+                await interaction.response.send_message(
+                    "This is not a text channel.",
+                    ephemeral=True,
+                )
+                return
+
+            target = self.values[0]
+            if not isinstance(target, discord.Member):
+                await interaction.response.send_message(
+                    "Please select a server member.",
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                await view.cog.tempchannel_service.add_member(
+                    interaction.user,
+                    interaction.channel,
+                    target,
+                )
+            except TempChannelError as exc:
+                await interaction.response.send_message(
+                    str(exc),
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException:
+                await interaction.response.send_message(
+                    "Discord could not update that member's permissions.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.send_message(
+                f"{target.mention} now has access to this channel.",
+                ephemeral=True,
+            )
+
+    class RemoveMemberSelect(discord.ui.UserSelect):
+        """Select an added member to remove from the temporary channel."""
+
+        def __init__(
+            self,
+            settings_view: "GhostyTempChannelSettingsView",
+        ) -> None:
+            self.settings_view = settings_view
+            super().__init__(
+                placeholder="Select an added member to remove...",
+                min_values=1,
+                max_values=1,
+                row=3,
+            )
+
+        async def callback(
+            self,
+            interaction: discord.Interaction,
+        ) -> None:
+            view = self.settings_view
+
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message(
+                    "This action must be used inside the server.",
+                    ephemeral=True,
+                )
+                return
+
+            if not isinstance(interaction.channel, discord.TextChannel):
+                await interaction.response.send_message(
+                    "This is not a text channel.",
+                    ephemeral=True,
+                )
+                return
+
+            target = self.values[0]
+            if not isinstance(target, discord.Member):
+                await interaction.response.send_message(
+                    "Please select a server member.",
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                await view.cog.tempchannel_service.remove_member(
+                    interaction.user,
+                    interaction.channel,
+                    target,
+                )
+            except TempChannelError as exc:
+                await interaction.response.send_message(
+                    str(exc),
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException:
+                await interaction.response.send_message(
+                    "Discord could not update that member's permissions.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.send_message(
+                f"Removed {target.mention} from this channel.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(
+        label="Delete channel",
+        style=discord.ButtonStyle.danger,
+        row=4,
+    )
+    async def delete_channel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        confirmation = discord.ui.View(timeout=60)
+
+        async def confirm_delete(
+            confirm_interaction: discord.Interaction,
+        ) -> None:
+            if confirm_interaction.user.id != self.owner_id:
+                await confirm_interaction.response.send_message(
+                    "Only the channel owner can confirm deletion.",
+                    ephemeral=True,
+                )
+                return
+
+            if (
+                confirm_interaction.guild is None
+                or confirm_interaction.channel_id != self.channel_id
+                or not isinstance(confirm_interaction.user, discord.Member)
+                or not isinstance(
+                    confirm_interaction.channel,
+                    discord.TextChannel,
+                )
+            ):
+                await confirm_interaction.response.send_message(
+                    "Return to the original temporary channel.",
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                await self.cog.tempchannel_service.delete_owned_channel(
+                    confirm_interaction.user,
+                    confirm_interaction.channel,
+                )
+            except TempChannelError as exc:
+                await confirm_interaction.response.send_message(
+                    str(exc),
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException:
+                await confirm_interaction.response.send_message(
+                    "Discord could not delete the channel.",
+                    ephemeral=True,
+                )
+                return
+
+            await confirm_interaction.response.send_message(
+                "Your temporary channel has been deleted.",
+                ephemeral=True,
+            )
+
+        async def cancel_delete(
+            cancel_interaction: discord.Interaction,
+        ) -> None:
+            if cancel_interaction.user.id != self.owner_id:
+                await cancel_interaction.response.send_message(
+                    "Only the channel owner can cancel this confirmation.",
+                    ephemeral=True,
+                )
+                return
+
+            await cancel_interaction.response.edit_message(
+                content="Channel deletion cancelled.",
+                view=None,
+            )
+
+        confirm_button = discord.ui.Button(
+            label="Confirm deletion",
+            style=discord.ButtonStyle.danger,
+        )
+        cancel_button = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.secondary,
+        )
+
+        confirm_button.callback = confirm_delete
+        cancel_button.callback = cancel_delete
+
+        confirmation.add_item(confirm_button)
+        confirmation.add_item(cancel_button)
+
+        await interaction.response.send_message(
+            "Are you sure you want to permanently delete this temporary channel?",
+            view=confirmation,
+            ephemeral=True,
+        )
+
+
 class GhostyCog(commands.Cog):
     ghosty = app_commands.Group(
         name="ghosty",
         description="Track Ghosty gamble results and channel statistics.",
     )
 
+    tempchannel = app_commands.Group(
+        name="tempchannel",
+        description="Manage your own Ghosty temporary channel.",
+    )
+
+    tempchannels = app_commands.Group(
+        name="tempchannels",
+        description="Staff management for Ghosty temporary channels.",
+    )
+
+    ghosty.add_command(tempchannel)
+    ghosty.add_command(tempchannels)
+
+    # tempchannel_staff = app_commands.Group(
+    #     name="staff",
+    #     description="Manage protected temporary-channel staff roles.",
+    # )
+
+    # tempchannel_roles = app_commands.Group(
+    #     name="roles",
+    #     description="Manage temporary-channel role quotas.",
+    # )
+
+    # tempchannels.add_command(tempchannel_staff)
+    # tempchannels.add_command(tempchannel_roles)
+
+    TEMPCHANNEL_STAFF_CHANNEL_ID = 1553860134357438484
+
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.service = GhostyService(bot)
+        self.tempchannel_service = GhostyTempChannelService(bot)
         self._initialized = False
     
     async def cog_load(self) -> None:
         await self.service.initialize()
+        await self.tempchannel_service.start()
         self._initialized = True
 
         self.bot.add_view(self._build_dashboard_controls_view())
@@ -47,6 +500,9 @@ class GhostyCog(commands.Cog):
     def cog_unload(self) -> None:
         if self.refresh_dashboard.is_running():
             self.refresh_dashboard.cancel()
+
+        if self.tempchannel_service.expiry_worker.is_running():
+            self.tempchannel_service.expiry_worker.cancel()
 
     # ---------------------------------------------------------
     # Permission helpers
@@ -103,6 +559,86 @@ class GhostyCog(commands.Cog):
             discord.HTTPException,
         ):
             return None
+
+    async def _require_tempchannel_staff(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        """Require the staff channel and an authorized staff member."""
+
+        if interaction.guild is None or not isinstance(
+            interaction.user, discord.Member
+        ):
+            await interaction.response.send_message(
+                "Use this command inside the server.",
+                ephemeral=True,
+            )
+            return False
+
+        if interaction.channel_id != self.TEMPCHANNEL_STAFF_CHANNEL_ID:
+            await interaction.response.send_message(
+                "Use temporary-channel staff commands in the designated staff channel.",
+                ephemeral=True,
+            )
+            return False
+
+        # Server managers can bootstrap or repair the configured staff roles.
+        if interaction.user.guild_permissions.manage_guild:
+            return True
+
+        settings = await self.tempchannel_service.get_settings(
+            interaction.guild.id
+        )
+        staff_role_ids = {
+            int(role_id)
+            for role_id in settings.get("staff_role_ids", [])
+        }
+
+        if any(role.id in staff_role_ids for role in interaction.user.roles):
+            return True
+
+        await interaction.response.send_message(
+            "You need Manage Server or a configured temporary-channel staff role.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _get_owned_tempchannel_context(
+        self,
+        interaction: discord.Interaction,
+    ) -> tuple[discord.Member, discord.TextChannel] | None:
+        """Resolve the current channel and require an active owned channel."""
+
+        if interaction.guild is None or not isinstance(
+            interaction.user, discord.Member
+        ):
+            await interaction.response.send_message(
+                "Use this command inside the server.",
+                ephemeral=True,
+            )
+            return None
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "Use this command inside a temporary text channel.",
+                ephemeral=True,
+            )
+            return None
+
+        try:
+            # This checks that the channel is active and belongs to the user.
+            await self.tempchannel_service._get_owned_channel(
+                interaction.user,
+                interaction.channel,
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc),
+                ephemeral=True,
+            )
+            return None
+
+        return interaction.user, interaction.channel
 
     # ---------------------------------------------------------
     # Dashboard
@@ -500,12 +1036,12 @@ class GhostyCog(commands.Cog):
                 [],
             )
 
-            # Preserve exclusions for channels that are no longer accessible.
             excluded_channel_ids: set[int] = {
                 int(channel_id)
                 for channel_id in existing_exclusions
             }
 
+            # Preserve exclusions for channels that are no longer accessible.
             excluded_channel_ids.intersection_update(
                 excluded_channel_ids - accessible_channel_ids
             )
@@ -550,9 +1086,7 @@ class GhostyCog(commands.Cog):
                     )
                 )
 
-                settings_container.add_item(
-                    discord.ui.Separator()
-                )
+                settings_container.add_item(discord.ui.Separator())
 
                 start_index = page * channels_per_page
                 page_channels = channels[
@@ -562,9 +1096,7 @@ class GhostyCog(commands.Cog):
                 if not channels:
                     settings_container.add_item(
                         discord.ui.TextDisplay(
-                            content=(
-                                "No accessible text channels were found."
-                            )
+                            content="No accessible text channels were found."
                         )
                     )
 
@@ -624,9 +1156,7 @@ class GhostyCog(commands.Cog):
 
                     settings_container.add_item(channel_row)
 
-                settings_container.add_item(
-                    discord.ui.Separator()
-                )
+                settings_container.add_item(discord.ui.Separator())
 
                 navigation_row = discord.ui.ActionRow()
 
@@ -685,8 +1215,9 @@ class GhostyCog(commands.Cog):
                     style=discord.ButtonStyle.secondary,
                 )
 
-
-                async def save_exclusions(interaction: discord.Interaction) -> None:
+                async def save_exclusions(
+                    save_interaction: discord.Interaction,
+                ) -> None:
                     current_exclusions = {
                         int(channel_id)
                         for channel_id in await repository.get_config(
@@ -696,13 +1227,17 @@ class GhostyCog(commands.Cog):
                         )
                     }
 
-                    accessible_channel_ids = {channel.id for channel in channels}
+                    accessible_ids = {
+                        channel.id for channel in channels
+                    }
 
-                    # Preserve exclusions for channels that aren't currently accessible.
-                    inaccessible_exclusions = current_exclusions - accessible_channel_ids
+                    # Preserve exclusions for inaccessible channels.
+                    inaccessible_exclusions = (
+                        current_exclusions - accessible_ids
+                    )
 
                     saved_exclusions = inaccessible_exclusions | (
-                        excluded_channel_ids & accessible_channel_ids
+                        excluded_channel_ids & accessible_ids
                     )
 
                     await repository.set_config(
@@ -711,31 +1246,36 @@ class GhostyCog(commands.Cog):
                         sorted(saved_exclusions),
                     )
 
-                    # Acknowledge the interaction before performing other operations.
-                    await interaction.response.defer(ephemeral=True)
+                    # Acknowledge before performing other operations.
+                    await save_interaction.response.defer(
+                        ephemeral=True
+                    )
 
                     # Delete the temporary settings panel.
                     try:
-                        await interaction.delete_original_response()
-                    except (discord.NotFound, discord.HTTPException):
+                        await save_interaction.delete_original_response()
+                    except (
+                        discord.NotFound,
+                        discord.HTTPException,
+                    ):
                         pass
 
-                    # Show confirmation immediately after deleting the settings panel.
-                    await interaction.followup.send(
+                    # Show confirmation immediately.
+                    await save_interaction.followup.send(
                         (
                             "Ghosty Market settings saved.\n"
                             f"**Excluded channels:** {len(saved_exclusions)}\n"
-                            "The dashboard will refresh shortly. Historical records have not been changed."
+                            "The dashboard will refresh shortly. "
+                            "Historical records have not been changed."
                         ),
                         ephemeral=True,
                     )
 
-                    # Give the confirmation a moment before rebuilding the dashboard.
+                    # Keep the existing 3-second confirmation delay.
                     await asyncio.sleep(3)
 
-                    # Delete the old dashboard and controls, then post fresh messages.
+                    # Delete the old dashboard and controls, then repost.
                     await self._repost_sticky_dashboard(guild)
-
 
                 async def restore_all(
                     restore_interaction: discord.Interaction,
@@ -785,9 +1325,89 @@ class GhostyCog(commands.Cog):
                 ephemeral=True,
             )
 
+        
+        async def show_settings_menu(
+            interaction: discord.Interaction,
+        ) -> None:
+            """Show the Ghosty settings menu to server members."""
+
+            if interaction.guild is None:
+                await interaction.response.send_message(
+                    "Use these settings inside a server.",
+                    ephemeral=True,
+                )
+                return
+
+            new_emoji = await get_application_emoji(
+                self.bot,
+                "new",
+                "➕",
+            )
+
+            gear_emoji = await get_application_emoji(
+                self.bot,
+                "gear",
+                "⚙️",
+            )
+
+            embed = discord.Embed(
+                title=f"{gear_emoji} Ghosty Settings",
+                description=(
+                    "Manage your Ghosty experience using the options below.\n\n"
+                    f"{new_emoji} **Create Temporary Channel**\n"
+                    "Create your own temporary channel for conversations, "
+                    "gaming, or hanging out with other members. Choose a channel "
+                    "name and how long it should stay active. "
+                    "The channel will be deleted automatically when its time expires."
+                ),
+                color=discord.Colour.dark_purple(),
+            )
+
+            menu = discord.ui.View(timeout=300)
+
+            create_button = discord.ui.Button(
+                label="Create Temporary Channel",
+                style=discord.ButtonStyle.success,
+                emoji=new_emoji,
+            )
+
+            async def create_temp_channel(
+                button_interaction: discord.Interaction,
+            ) -> None:
+                await self._show_tempchannel_creator(button_interaction)
+
+            create_button.callback = create_temp_channel
+            menu.add_item(create_button)
+
+            permissions = interaction.user.guild_permissions
+
+            if permissions.administrator or permissions.manage_guild:
+                market_button = discord.ui.Button(
+                    label="",
+                    style=discord.ButtonStyle.secondary,
+                    emoji=gear_emoji,
+                )
+
+                async def open_market_settings(
+                    button_interaction: discord.Interaction,
+                ) -> None:
+                    await show_settings(button_interaction)
+
+                market_button.callback = open_market_settings
+                menu.add_item(market_button)
+
+            await interaction.response.send_message(
+                embed=embed,
+                view=menu,
+                ephemeral=True,
+            )
+
+
         terms_button.callback = show_terms
         policy_button.callback = show_policy
-        settings_button.callback = show_settings
+
+        # The gear MUST open the menu, not the channel-list settings directly.
+        settings_button.callback = show_settings_menu
 
         row.add_item(terms_button)
         row.add_item(policy_button)
@@ -1377,7 +1997,432 @@ class GhostyCog(commands.Cog):
             f"Ghosty dashboard and controls configured in {channel.mention}.",
             ephemeral=True,
         )
-        
+
+    @tempchannels.command(
+        name="role-set",
+        description="Set the personal and total quota for a Discord role.",
+    )
+    @app_commands.describe(
+        role="Role receiving this quota.",
+        personal="Maximum active channels per member with this role.",
+        total="Maximum active channels assigned to this role's quota.",
+    )
+    async def tempchannel_roles_set(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        personal: app_commands.Range[int, 1, 100],
+        total: app_commands.Range[int, 1, 1000],
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        try:
+            await self.tempchannel_service.set_role_limits(
+                interaction.guild.id,
+                role.id,
+                personal,
+                total,
+                role.name,
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc), ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Updated quota for {role.mention}:\n"
+            f"• Personal active-channel limit: **{personal}**\n"
+            f"• Total channels assigned to this role's quota: **{total}**",
+            ephemeral=True,
+        )
+
+    @tempchannels.command(
+        name="role-remove",
+        description="Remove a role's custom quota and use the default quota.",
+    )
+    async def tempchannel_roles_remove(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        await self.tempchannel_service.remove_role_limits(
+            interaction.guild.id, role.id
+        )
+
+        await interaction.response.send_message(
+            f"Removed the custom quota for {role.mention}. "
+            "Future channels will use the highest applicable configured role "
+            "or the default quota.",
+            ephemeral=True,
+        )
+
+    @tempchannels.command(
+        name="role-list",
+        description="List configured role quotas and default quotas.",
+    )
+    async def tempchannel_roles_list(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        settings = await self.tempchannel_service.get_settings(
+            interaction.guild.id
+        )
+
+        lines = [
+            "**Default quota**",
+            f"Personal: **{settings.get('default_personal_limit', 1)}**",
+            f"Total: **{settings.get('default_total_limit', 10)}**",
+            "",
+            "**Role quotas**",
+        ]
+
+        role_limits = settings.get("role_limits", [])
+        for item in role_limits:
+            role_id = int(item["role_id"])
+            role = interaction.guild.get_role(role_id)
+            role_name = role.mention if role else item.get(
+                "role_name", str(role_id)
+            )
+
+            lines.append(
+                f"{role_name} — personal: **{item['personal']}**, "
+                f"total: **{item['total']}**"
+            )
+
+        if not role_limits:
+            lines.append("No custom role quotas configured.")
+
+        await interaction.response.send_message(
+            "\n".join(lines),
+            ephemeral=True,
+        )
+
+    @tempchannels.command(
+        name="staff-add",
+        description="Give a role protected staff access to temporary channels.",
+    )
+    async def tempchannel_staff_add(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        settings = await self.tempchannel_service.get_settings(
+            interaction.guild.id
+        )
+        role_ids = {
+            int(role_id)
+            for role_id in settings.get("staff_role_ids", [])
+        }
+
+        if role.id in role_ids:
+            await interaction.response.send_message(
+                f"{role.mention} is already a protected staff role.",
+                ephemeral=True,
+            )
+            return
+
+        role_ids.add(role.id)
+        await self.tempchannel_service.set_staff_roles(
+            interaction.guild.id, list(role_ids)
+        )
+
+        await interaction.response.send_message(
+            f"Added {role.mention} to the configured staff roles. "
+            "This applies to channels when their permissions are next updated; "
+            "existing channels may need their permissions refreshed.",
+            ephemeral=True,
+        )
+
+    @tempchannels.command(
+        name="staff-remove",
+        description="Remove a role from the protected staff-role list.",
+    )
+    async def tempchannel_staff_remove(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        settings = await self.tempchannel_service.get_settings(
+            interaction.guild.id
+        )
+        role_ids = {
+            int(role_id)
+            for role_id in settings.get("staff_role_ids", [])
+        }
+
+        if role.id not in role_ids:
+            await interaction.response.send_message(
+                f"{role.mention} is not a configured staff role.",
+                ephemeral=True,
+            )
+            return
+
+        role_ids.remove(role.id)
+        await self.tempchannel_service.set_staff_roles(
+            interaction.guild.id, list(role_ids)
+        )
+
+        await interaction.response.send_message(
+            f"Removed {role.mention} from the configured staff roles. "
+            "Existing channel permission overwrites may need to be refreshed.",
+            ephemeral=True,
+        )
+
+    @tempchannels.command(
+        name="staff-list",
+        description="List protected temporary-channel staff roles.",
+    )
+    async def tempchannel_staff_list(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        settings = await self.tempchannel_service.get_settings(
+            interaction.guild.id
+        )
+        role_ids = settings.get("staff_role_ids", [])
+
+        role_lines = []
+        for role_id in role_ids:
+            role = interaction.guild.get_role(int(role_id))
+            role_lines.append(
+                role.mention if role else f"Deleted role (`{role_id}`)"
+            )
+
+        await interaction.response.send_message(
+            "**Protected temporary-channel staff roles**\n"
+            + ("\n".join(role_lines) if role_lines else "None configured."),
+            ephemeral=True,
+        )
+
+    @tempchannels.command(
+        name="settings",
+        description="View or enable/disable temporary-channel creation.",
+    )
+    @app_commands.describe(
+        enabled="Whether members can create new temporary channels."
+    )
+    async def tempchannels_settings(
+        self,
+        interaction: discord.Interaction,
+        enabled: bool | None = None,
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        if enabled is not None:
+            await self.tempchannel_service.set_enabled(
+                interaction.guild.id, enabled
+            )
+
+        settings = await self.tempchannel_service.get_settings(
+            interaction.guild.id
+        )
+
+        staff_roles = settings.get("staff_role_ids", [])
+        role_limits = settings.get("role_limits", [])
+
+        embed = discord.Embed(
+            title="Ghosty Temporary-Channel Settings",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Creation",
+            value="Enabled" if settings.get("enabled", True) else "Disabled",
+            inline=True,
+        )
+        embed.add_field(
+            name="Category",
+            value=f"<#{settings.get('category_id', 0)}>",
+            inline=True,
+        )
+        embed.add_field(
+            name="Default quotas",
+            value=(
+                f"Personal: **{settings.get('default_personal_limit', 1)}**\n"
+                f"Total: **{settings.get('default_total_limit', 10)}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Member cap per channel",
+            value=str(settings.get("max_ordinary_members", 20)),
+            inline=True,
+        )
+        embed.add_field(
+            name="Protected staff roles",
+            value=", ".join(f"<@&{role_id}>" for role_id in staff_roles)
+            if staff_roles else "None configured",
+            inline=False,
+        )
+        embed.add_field(
+            name="Role quota configurations",
+            value=str(len(role_limits)),
+            inline=True,
+        )
+
+        await interaction.response.send_message(
+            embed=embed, ephemeral=True
+        )
+
+    @tempchannels.command(
+        name="list",
+        description="List active Ghosty temporary channels.",
+    )
+    async def tempchannels_list(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        records = await tempchannel_repository.get_all_active_channels(
+            interaction.guild.id
+        )
+
+        if not records:
+            await interaction.response.send_message(
+                "There are no active temporary channels.",
+                ephemeral=True,
+            )
+            return
+
+        lines: list[str] = []
+        for record in records:
+            channel_id = int(record["channel_id"])
+            creator_id = int(record["creator_id"])
+            channel = interaction.guild.get_channel(channel_id)
+            channel_text = (
+                channel.mention if channel else f"`{channel_id}` (not found)"
+            )
+
+            expires_at = record.get("expires_at")
+            if expires_at is not None:
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(
+                        tzinfo=discord.utils.utcnow().tzinfo
+                    )
+                expiry_text = f"<t:{int(expires_at.timestamp())}:R>"
+            else:
+                expiry_text = "Unknown expiry"
+
+            lines.append(
+                f"{channel_text} — owner <@{creator_id}> — {expiry_text}"
+            )
+
+        # Discord message content has a 2,000-character limit.
+        pages = []
+        current_page = []
+        current_length = 0
+
+        for line in lines:
+            if current_page and current_length + len(line) + 1 > 1800:
+                pages.append(current_page)
+                current_page = []
+                current_length = 0
+
+            current_page.append(line)
+            current_length += len(line) + 1
+
+        if current_page:
+            pages.append(current_page)
+
+        await interaction.response.send_message(
+            f"**Active temporary channels: {len(records)}**\n"
+            + "\n".join(pages[0]),
+            ephemeral=True,
+        )
+
+        for index, page in enumerate(pages[1:], start=2):
+            await interaction.followup.send(
+                f"**Temporary channels — page {index}**\n"
+                + "\n".join(page),
+                ephemeral=True,
+            )
+
+    @tempchannels.command(
+        name="delete",
+        description="Manually delete an active temporary channel by ID.",
+    )
+    @app_commands.describe(
+        channel_id="The numeric Discord channel ID to delete."
+    )
+    async def tempchannels_delete(
+        self,
+        interaction: discord.Interaction,
+        channel_id: str,
+    ) -> None:
+        if not await self._require_tempchannel_staff(interaction):
+            return
+
+        assert interaction.guild is not None
+
+        try:
+            parsed_channel_id = int(channel_id.strip())
+        except (TypeError, ValueError):
+            await interaction.response.send_message(
+                "Enter a valid numeric channel ID.",
+                ephemeral=True,
+            )
+            return
+
+        record = await tempchannel_repository.get_active_channel(
+            interaction.guild.id,
+            parsed_channel_id,
+        )
+        if record is None:
+            await interaction.response.send_message(
+                "No active temporary-channel record was found for that ID.",
+                ephemeral=True,
+            )
+            return
+
+        channel = interaction.guild.get_channel(parsed_channel_id)
+        channel_label = (
+            f"#{channel.name}" if channel else str(parsed_channel_id)
+        )
+
+        await self.tempchannel_service.delete_channel(
+            interaction.guild,
+            parsed_channel_id,
+        )
+
+        await interaction.response.send_message(
+            f"Processed manual deletion for temporary channel **{channel_label}**.",
+            ephemeral=True,
+        )
 
     # ---------------------------------------------------------
     # /ghosty test
@@ -1607,6 +2652,284 @@ class GhostyCog(commands.Cog):
             ephemeral=True,
         )
 
+    
+    @commands.group(
+        name="ghosty",
+        invoke_without_command=True,
+    )
+    async def ghosty_text(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        """Prefix-command entry point for Ghosty."""
+        await ctx.send(
+            "Use `ghosty tempchannel settings` inside your own "
+            "active temporary channel."
+        )
+
+    @ghosty_text.group(
+        name="tempchannel",
+        invoke_without_command=True,
+    )
+    async def ghosty_tempchannel_text(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        await ctx.send(
+            "Use `ghosty tempchannel settings` to open your channel settings."
+        )
+
+    @ghosty_tempchannel_text.command(
+        name="settings",
+    )
+    async def ghosty_tempchannel_settings_text(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        """Open the settings panel for the current owned temp channel."""
+
+        if ctx.guild is None or not isinstance(ctx.author, discord.Member):
+            await ctx.send("Use this command inside the server.")
+            return
+
+        if not isinstance(ctx.channel, discord.TextChannel):
+            await ctx.send("Use this command inside your temporary text channel.")
+            return
+
+        try:
+            await self.tempchannel_service._get_owned_channel(
+                ctx.author,
+                ctx.channel,
+            )
+        except TempChannelError as exc:
+            await ctx.send(str(exc))
+            return
+
+        view = GhostyTempChannelSettingsView(
+            cog=self,
+            owner_id=ctx.author.id,
+            channel_id=ctx.channel.id,
+        )
+
+        embed = discord.Embed(
+            title="Ghosty Temporary Channel Settings",
+            description=(
+                "Manage your temporary channel using the controls below.\n\n"
+                "• Change visibility\n"
+                "• Add or remove a member\n"
+                "• Extend the expiry time\n"
+                "• Delete the channel"
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(
+            text="Only this channel's owner can use these controls."
+        )
+
+        await ctx.send(embed=embed, view=view)
+
+
+    # ---------------------------------------------------------
+    # /ghosty tempchannel
+    # ---------------------------------------------------------
+
+    @tempchannel.command(
+        name="visibility",
+        description="Make your temporary channel public or private.",
+    )
+    @app_commands.choices(
+        visibility=[
+            app_commands.Choice(name="Public", value="public"),
+            app_commands.Choice(name="Private", value="private"),
+        ]
+    )
+    async def tempchannel_visibility(
+        self,
+        interaction: discord.Interaction,
+        visibility: app_commands.Choice[str],
+    ) -> None:
+        context = await self._get_owned_tempchannel_context(interaction)
+        if context is None:
+            return
+
+        owner, channel = context
+
+        try:
+            await self.tempchannel_service.set_visibility(
+                owner, channel, visibility.value
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc), ephemeral=True
+            )
+            return
+        except discord.HTTPException:
+            logger.exception("Failed to change temporary-channel visibility")
+            await interaction.response.send_message(
+                "Discord could not update the channel permissions.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Your channel is now **{visibility.value}**.",
+            ephemeral=True,
+        )
+
+    @tempchannel.command(
+        name="add",
+        description="Give a member access to your temporary channel.",
+    )
+    async def tempchannel_add(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+    ) -> None:
+        context = await self._get_owned_tempchannel_context(interaction)
+        if context is None:
+            return
+
+        owner, channel = context
+
+        try:
+            await self.tempchannel_service.add_member(
+                owner, channel, member
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc), ephemeral=True
+            )
+            return
+        except discord.HTTPException:
+            logger.exception("Failed to add member to temporary channel")
+            await interaction.response.send_message(
+                "Discord could not update that member's channel permissions.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"{member.mention} now has access to {channel.mention}.",
+            ephemeral=True,
+        )
+
+    @tempchannel.command(
+        name="remove",
+        description="Remove an added member from your temporary channel.",
+    )
+    async def tempchannel_remove(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+    ) -> None:
+        context = await self._get_owned_tempchannel_context(interaction)
+        if context is None:
+            return
+
+        owner, channel = context
+
+        try:
+            await self.tempchannel_service.remove_member(
+                owner, channel, member
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc), ephemeral=True
+            )
+            return
+        except discord.HTTPException:
+            logger.exception("Failed to remove member from temporary channel")
+            await interaction.response.send_message(
+                "Discord could not update that member's channel permissions.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Removed {member.mention} from your temporary channel.",
+            ephemeral=True,
+        )
+
+    @tempchannel.command(
+        name="extend",
+        description="Extend the expiry of your temporary channel.",
+    )
+    @app_commands.choices(
+        duration=[
+            app_commands.Choice(name="1 hour", value="1h"),
+            app_commands.Choice(name="2 hours", value="2h"),
+            app_commands.Choice(name="6 hours", value="6h"),
+            app_commands.Choice(name="12 hours", value="12h"),
+            app_commands.Choice(name="1 day", value="1d"),
+            app_commands.Choice(name="3 days", value="3d"),
+            app_commands.Choice(name="7 days", value="7d"),
+        ]
+    )
+    async def tempchannel_extend(
+        self,
+        interaction: discord.Interaction,
+        duration: app_commands.Choice[str],
+    ) -> None:
+        context = await self._get_owned_tempchannel_context(interaction)
+        if context is None:
+            return
+
+        owner, channel = context
+
+        try:
+            expires_at = await self.tempchannel_service.extend_channel(
+                owner, channel, duration.value
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc), ephemeral=True
+            )
+            return
+
+        timestamp = int(expires_at.timestamp())
+        await interaction.response.send_message(
+            f"Your channel expiry is now <t:{timestamp}:F> "
+            f"(<t:{timestamp}:R>).",
+            ephemeral=True,
+        )
+
+    @tempchannel.command(
+        name="delete",
+        description="Delete your own temporary channel immediately.",
+    )
+    async def tempchannel_delete(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        context = await self._get_owned_tempchannel_context(interaction)
+        if context is None:
+            return
+
+        owner, channel = context
+        channel_name = channel.name
+
+        try:
+            await self.tempchannel_service.delete_owned_channel(
+                owner, channel
+            )
+        except TempChannelError as exc:
+            await interaction.response.send_message(
+                str(exc), ephemeral=True
+            )
+            return
+        except discord.HTTPException:
+            logger.exception("Failed to delete temporary channel")
+            await interaction.response.send_message(
+                "Discord could not delete the channel. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Your temporary channel **#{channel_name}** has been deleted.",
+            ephemeral=True,
+        )
+
     # ---------------------------------------------------------
     # /ghosty backfill
     # ---------------------------------------------------------
@@ -1805,6 +3128,129 @@ class GhostyCog(commands.Cog):
             ephemeral=True,
         )
 
+    async def _show_tempchannel_creator(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        """Open the temporary-channel creation form."""
+
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Use this feature inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        class TempChannelCreateModal(discord.ui.Modal):
+            def __init__(modal_self) -> None:
+                super().__init__(
+                    title="Create Temporary Channel",
+                    timeout=300,
+                )
+
+                modal_self.channel_name = discord.ui.TextInput(
+                    label="Channel name",
+                    placeholder="e.g. gaming-lounge",
+                    min_length=1,
+                    max_length=100,
+                    required=True,
+                )
+
+                modal_self.add_item(modal_self.channel_name)
+
+            async def on_submit(
+                modal_self,
+                submit_interaction: discord.Interaction,
+            ) -> None:
+                await submit_interaction.response.send_message(
+                    "Choose how long the channel should exist.",
+                    view=TempChannelDurationView(
+                        submit_interaction.user,
+                        modal_self.channel_name.value.strip(),
+                    ),
+                    ephemeral=True,
+                )
+
+        class TempChannelDurationView(discord.ui.View):
+            def __init__(
+                view_self,
+                user: discord.abc.User,
+                channel_name: str,
+            ) -> None:
+                super().__init__(timeout=180)
+                view_self.user_id = user.id
+                view_self.channel_name = channel_name
+
+                options = [
+                    discord.SelectOption(label="1 hour", value="1h"),
+                    discord.SelectOption(label="2 hours", value="2h"),
+                    discord.SelectOption(label="6 hours", value="6h"),
+                    discord.SelectOption(label="12 hours", value="12h"),
+                    discord.SelectOption(label="1 day", value="1d"),
+                    discord.SelectOption(label="3 days", value="3d"),
+                    discord.SelectOption(label="7 days", value="7d"),
+                ]
+
+                select = discord.ui.Select(
+                    placeholder="Select duration",
+                    min_values=1,
+                    max_values=1,
+                    options=options,
+                )
+                select.callback = view_self.create_channel
+                view_self.add_item(select)
+
+            async def create_channel(
+                view_self,
+                select_interaction: discord.Interaction,
+            ) -> None:
+                if select_interaction.user.id != view_self.user_id:
+                    await select_interaction.response.send_message(
+                        "This creation form belongs to another member.",
+                        ephemeral=True,
+                    )
+                    return
+
+                member = select_interaction.user
+                if not isinstance(member, discord.Member):
+                    await select_interaction.response.send_message(
+                        "I couldn't identify your server membership.",
+                        ephemeral=True,
+                    )
+                    return
+
+                duration_key = select_interaction.data["values"][0]
+
+                await select_interaction.response.defer(ephemeral=True)
+
+                try:
+                    channel = await self.tempchannel_service.create_channel(
+                        member=member,
+                        name=view_self.channel_name,
+                        duration_key=duration_key,
+                    )
+                except TempChannelError as exc:
+                    await select_interaction.followup.send(
+                        str(exc),
+                        ephemeral=True,
+                    )
+                    return
+                except discord.HTTPException:
+                    logger.exception(
+                        "Failed to create a Ghosty temporary channel."
+                    )
+                    await select_interaction.followup.send(
+                        "Discord couldn't create the channel. Please try again.",
+                        ephemeral=True,
+                    )
+                    return
+
+                await select_interaction.followup.send(
+                    f"Your temporary channel {channel.mention} is ready!",
+                    ephemeral=True,
+                )
+
+        await interaction.response.send_modal(TempChannelCreateModal())
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(GhostyCog(bot))
