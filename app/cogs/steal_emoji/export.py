@@ -51,22 +51,19 @@ def convert_image(data: bytes, target_format: str) -> bytes:
             first.save(output, format="PNG")
 
         elif target_format == "GIF":
-            palette_source = Image.new(
-                "RGBA",
-                first.size,
-                (0, 0, 0, 0),
-            )
+            # Sample every frame separately. Compositing them on top of one
+            # another drops earlier colors and can collapse an animation.
+            palette_source = Image.new("RGB", (64, 64 * len(frames)), "white")
+            for index, frame in enumerate(frames):
+                sample = frame.copy()
+                sample.thumbnail((64, 64), Image.Resampling.LANCZOS)
+                palette_source.paste(
+                    sample.convert("RGB"),
+                    (0, index * 64),
+                    mask=sample.getchannel("A"),
+                )
 
-            for frame in frames:
-                palette_source.alpha_composite(frame)
-
-            rgb_source = Image.new("RGB", palette_source.size, "white")
-            rgb_source.paste(
-                palette_source.convert("RGB"),
-                mask=palette_source.getchannel("A"),
-            )
-
-            palette = rgb_source.quantize(
+            palette = palette_source.quantize(
                 colors=255,
                 method=Image.Quantize.MEDIANCUT,
             )

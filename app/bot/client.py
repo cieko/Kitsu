@@ -48,8 +48,8 @@ class Kitsu(commands.Bot):
         await self.load_extension("app.cogs.steal_emoji")
         print("Steal emoji extension loaded")
 
-        await self.load_extension("app.cogs.translation")
-        print("Translation extension loaded")
+        await self.load_extension("app.cogs.emoji_mood")
+        print("Emoji mood extension loaded")
 
         await self.load_extension("app.cogs.ghosty")
         print("Ghosty extension loaded")

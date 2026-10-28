@@ -1,15 +1,19 @@
 import asyncio
+import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
 from discord import app_commands
+from PIL import Image
 
 
 def member(user_id=2, **permissions):
     user = MagicMock(spec=discord.Member)
     user.id = user_id
+    user.guild = SimpleNamespace(id=1, owner_id=99)
+    user.roles = []
     user.guild_permissions = discord.Permissions(**permissions)
     return user
 
@@ -28,7 +32,6 @@ def interaction(user, guild_id=1):
     "module_name,class_name,group_name,permission",
     [
         ("emoji_gif", "EmojiGif", "channel", "manage_channels"),
-        ("translation", "TranslationCog", "translation", "manage_guild"),
     ],
 )
 @pytest.mark.parametrize("authorized", [False, True])
@@ -53,8 +56,6 @@ def test_every_configuration_subcommand_checks_member_permissions(
                 current = interaction(member(**{permission: authorized}))
                 assert await command._check_can_run(current) is authorized
                 assert current.response.send_message.await_count == (0 if authorized else 1)
-            if group_name == "translation":
-                assert await cog.translate_command._check_can_run(interaction(member()))
         finally:
             await client.close()
 
@@ -113,7 +114,8 @@ def test_prefix_lookup_remains_public_and_whitespace_cannot_be_saved(import_app,
         ({}, {"create_expressions": True}, False),
         ({"manage_expressions": True}, {"create_expressions": True}, False),
         ({"create_expressions": True}, {}, False),
-        ({"create_expressions": True}, {"create_expressions": True}, True),
+        ({"create_expressions": True}, {"create_expressions": True}, False),
+        ({"administrator": True}, {}, False),
         ({"administrator": True}, {"administrator": True}, True),
     ],
 )
@@ -121,7 +123,9 @@ def test_public_emoji_button_checks_actor_and_bot(
     import_app, monkeypatch, user_permissions, bot_permissions, allowed
 ):
     module = import_app("app.cogs.steal_emoji")
-    download = AsyncMock(return_value=b"image")
+    image = io.BytesIO()
+    Image.new("RGBA", (16, 16), "red").save(image, format="PNG")
+    download = AsyncMock(return_value=image.getvalue())
     monkeypatch.setattr(module.components, "download_file", download)
 
     async def check():

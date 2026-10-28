@@ -12,6 +12,8 @@ class StealItem:
     url: str
     animated: bool
     source_format: str
+    description: str = ""
+    emoji: str = "🍥"
 
     @property
     def export_options(self) -> list[str]:

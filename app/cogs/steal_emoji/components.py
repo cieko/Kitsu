@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+import io
+import re
+from typing import TYPE_CHECKING, Literal
+
+import aiohttp
+import discord
+
+from app.bot.permissions import is_guild_moderator
 
 from .constants import ASSET_COLOR, logger
+from .errors import send_upload_reply, upload_error_message
 from .export import download_file, export_item
 from .models import StealItem
+from .upload import add_to_server
 
 if TYPE_CHECKING:
     from .view import StealEmojiView
-import io
-import re
-from typing import Literal
-
-import discord
-
-from app.bot.permissions import require_guild_permission
 
 
 class StealToServerButton(discord.ui.Button):
@@ -37,16 +40,13 @@ class StealToServerButton(discord.ui.Button):
             )
             return
 
-        if item.item_type != "emoji":
+        if not isinstance(interaction.user, discord.Member) or not is_guild_moderator(
+            interaction.user
+        ):
             await interaction.response.send_message(
-                "The Steal button currently supports custom emojis only.",
+                "Only server admins and moderators can use the Steal button.",
                 ephemeral=True,
             )
-            return
-
-        if not await require_guild_permission(
-            interaction, "create_expressions", "Create Expressions"
-        ):
             return
 
         bot_member = guild.me
@@ -63,39 +63,56 @@ class StealToServerButton(discord.ui.Button):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
+        upload_started = False
         try:
-            image_bytes = await download_file(item.url)
-
-            emoji = await guild.create_custom_emoji(
-                name=item.name[:32],
-                image=image_bytes,
-                reason=f"Emoji added by {interaction.user}",
-            )
-
-            await interaction.followup.send(
-                f"Successfully added {emoji} (`{emoji.name}`) to **{guild.name}**!",
-                ephemeral=True,
-            )
-
-        except discord.HTTPException as exc:
-            logger.exception(
-                "[STEAL] Could not add emoji | item_id=%s",
+            data = await download_file(item.url)
+            upload_started = True
+            asset = await add_to_server(guild, item, data, actor=interaction.user)
+        except (
+            discord.HTTPException,
+            discord.RateLimited,
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+        ) as exc:
+            logger.warning(
+                "[STEAL] Upload failed | type=%s item_id=%s status=%s code=%s error=%s",
+                item.item_type,
                 item.item_id,
+                getattr(exc, "status", None),
+                getattr(exc, "code", None),
+                type(exc).__name__,
             )
-            await interaction.followup.send(
-                f"Discord couldn't add this emoji: {exc}",
-                ephemeral=True,
+            await send_upload_reply(
+                interaction,
+                item,
+                upload_error_message(exc, item.item_type, upload_started=upload_started),
             )
+            return
+
+        except ValueError as exc:
+            await send_upload_reply(interaction, item, str(exc))
+            return
 
         except Exception:
             logger.exception(
-                "[STEAL] Failed to add emoji | item_id=%s",
+                "[STEAL] Failed to add %s | item_id=%s",
+                item.item_type,
                 item.item_id,
             )
-            await interaction.followup.send(
-                "Something went wrong while adding the emoji.",
-                ephemeral=True,
+            await send_upload_reply(
+                interaction,
+                item,
+                f"Something went wrong while adding the {item.item_type}.",
             )
+            return
+
+        label = str(asset) if item.item_type == "emoji" else "sticker"
+        await send_upload_reply(
+            interaction,
+            item,
+            f"Successfully added {label} (`{asset.name}`) to **{guild.name}**!",
+            added=True,
+        )
 
 
 def build_asset_container(

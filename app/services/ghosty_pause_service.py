@@ -13,6 +13,10 @@ import discord
 from discord.ext import tasks
 from pymongo.errors import ConnectionFailure
 
+from app.bot.permissions import (
+    MODERATOR_ROLE_ID as PAUSE_MOD_ROLE_ID,
+    is_guild_moderator as is_pause_moderator,
+)
 from app.database.repositories import ghosty_pause_repository as repository
 from app.database.repositories import ghosty_repository as tracking
 from app.services.ghosty_prediction import utc
@@ -20,20 +24,12 @@ from app.services.ghosty_service import GHOSTY_BOT_ID, GhostyService, result_bel
 
 
 logger = logging.getLogger(__name__)
-PAUSE_MOD_ROLE_ID = 1553874776219713566
 PAUSE_DURATIONS = {"5m": 300, "10m": 600, "15m": 900, "30m": 1800,
                    "1h": 3600, "3h": 10800, "6h": 21600, "12h": 43200}
 
 
 class PauseError(Exception):
     """Expected eligibility, access, or restoration failure."""
-
-
-def is_pause_moderator(member: discord.Member) -> bool:
-    return (
-        member.id == member.guild.owner_id or member.guild_permissions.administrator
-        or any(role.id == PAUSE_MOD_ROLE_ID for role in member.roles)
-    )
 
 
 def is_role(target: Any) -> bool:

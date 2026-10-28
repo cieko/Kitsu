@@ -117,7 +117,7 @@ def get_custom_emojis(content: str) -> list[StealItem]:
 
 
 def get_message_stickers(
-    message: discord.Message,
+    message: discord.Message | discord.MessageSnapshot,
 ) -> list[StealItem]:
     stickers: list[StealItem] = []
 
@@ -128,7 +128,7 @@ def get_message_stickers(
         "gif": "gif",
     }
 
-    for sticker in message.stickers:
+    for sticker in getattr(message, "stickers", None) or []:
         sticker_format = getattr(sticker.format, "name", "").lower()
         source_format = format_map.get(sticker_format, "unknown")
 
@@ -139,6 +139,8 @@ def get_message_stickers(
             url=str(sticker.url),
             animated=source_format in {"apng", "gif", "lottie"},
             source_format=source_format,
+            description=getattr(sticker, "description", None) or "",
+            emoji=getattr(sticker, "emoji", None) or "🍥",
         )
 
         stickers.append(item)
@@ -189,6 +191,8 @@ def get_message_items(message: discord.Message) -> list[StealItem]:
 
     emojis = get_custom_emojis("\n".join(content_parts))
     stickers = get_message_stickers(message)
+    for snapshot in getattr(message, "message_snapshots", None) or []:
+        stickers.extend(get_message_stickers(snapshot))
 
     result: list[StealItem] = []
     seen: set[tuple[str, int]] = set()

@@ -21,11 +21,11 @@ def test_application_and_test_modules_stay_within_400_lines():
 def test_reorganized_extensions_register_commands_with_their_cogs(import_app, monkeypatch):
     extensions = {
         "emoji_gif": "EmojiGif",
+        "emoji_mood": "EmojiMood",
         "ghosty": "GhostyCog",
         "schedules": "Schedules",
         "steal_emoji": "StealEmoji",
         "sticky": "Sticky",
-        "translation": "TranslationCog",
     }
 
     async def check():
@@ -44,7 +44,8 @@ def test_reorganized_extensions_register_commands_with_their_cogs(import_app, mo
             assert ghosty.get_command("tempchannel").get_command("visibility")
             assert ghosty.get_command("tempchannels").get_command("role-set")
             assert bot.get_command("ghosty tempchannel settings")
-            assert bot.tree.get_command("translation").get_command("set-channel")
+            assert bot.tree.get_command("translation") is None
+            assert bot.tree.get_command("translate") is None
             assert {command.name for command in bot.tree.get_command("sticky").commands} == {
                 "add",
                 "edit",

@@ -4,6 +4,18 @@ import discord
 from discord import app_commands
 
 
+MODERATOR_ROLE_ID = 1553874776219713566
+
+
+def is_guild_moderator(member: discord.Member) -> bool:
+    """Allow the server owner, administrators, and the configured moderator role."""
+    return (
+        member.id == member.guild.owner_id
+        or member.guild_permissions.administrator
+        or any(role.id == MODERATOR_ROLE_ID for role in member.roles)
+    )
+
+
 async def require_guild_permission(
     interaction: discord.Interaction,
     permission: str,
