@@ -15,6 +15,7 @@ class Prefix(commands.Cog):
         print("Prefix Cog loaded")
 
     @commands.command(name="prefix")
+    @commands.guild_only()
     async def prefix(self, ctx: commands.Context, action: str = None, new_prefix: str = None):
         guild_id = ctx.guild.id
 
@@ -27,8 +28,20 @@ class Prefix(commands.Cog):
             )
             return
 
+        action = action.casefold()
+        if action in {"set", "reset"} and not (
+            isinstance(ctx.author, discord.Member)
+            and (
+                ctx.author.guild_permissions.administrator
+                or ctx.author.guild_permissions.manage_guild
+            )
+        ):
+            await ctx.send("You need **Manage Server** permission to change the prefix.")
+            return
+
         # ,k prefix set !
-        if action.lower() == "set":
+        if action == "set":
+            new_prefix = new_prefix.strip() if new_prefix else ""
             if not new_prefix:
                 await ctx.send("Please provide a new prefix.")
                 return
@@ -45,7 +58,7 @@ class Prefix(commands.Cog):
             return
 
         # ,k prefix reset
-        if action.lower() == "reset":
+        if action == "reset":
             await reset_prefix(guild_id)
 
             await ctx.send(

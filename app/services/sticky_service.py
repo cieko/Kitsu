@@ -2,7 +2,6 @@ import re
 
 import discord
 
-
 DIRECTIVE_PATTERN = re.compile(
     r"\{(embed|content|color|title|description|footer|thumbnail|image)"
     r"\s*(?::\s*|\})",
@@ -29,20 +28,16 @@ class StickyService:
         fields: dict[str, str] = {}
         embed_requested = False
 
-        prefix = script[:matches[0].start()].strip()
+        prefix = script[: matches[0].start()].strip()
         if prefix:
             content_parts.append(prefix)
 
         for index, match in enumerate(matches):
             key = match.group(1).lower()
 
-            end = (
-                matches[index + 1].start()
-                if index + 1 < len(matches)
-                else len(script)
-            )
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(script)
 
-            value = script[match.end():end].strip()
+            value = script[match.end() : end].strip()
 
             if value.endswith("}"):
                 value = value[:-1].rstrip()
@@ -55,10 +50,13 @@ class StickyService:
             else:
                 fields[key] = value
 
-        content = self._resolve(
-            "\n".join(content_parts).strip(),
-            guild,
-        ) or ""
+        content = (
+            self._resolve(
+                "\n".join(content_parts).strip(),
+                guild,
+            )
+            or ""
+        )
 
         self._validate_content(content)
 
@@ -73,20 +71,14 @@ class StickyService:
 
         embed = None
 
-        if embed_requested or any(
-            key in fields for key in embed_fields
-        ):
+        if embed_requested or any(key in fields for key in embed_fields):
             embed = discord.Embed()
 
             if fields.get("color"):
                 try:
-                    embed.color = discord.Color.from_str(
-                        fields["color"]
-                    )
+                    embed.color = discord.Color.from_str(fields["color"])
                 except (ValueError, TypeError) as exc:
-                    raise ValueError(
-                        "Invalid embed color. Use a color such as #73052B."
-                    ) from exc
+                    raise ValueError("Invalid embed color. Use a color such as #73052B.") from exc
 
             title = self._resolve(fields.get("title"), guild)
             description = self._resolve(
@@ -133,10 +125,7 @@ class StickyService:
 
         icon_url = guild.icon.url if guild.icon else ""
 
-        return (
-            value.replace("{guild.name}", guild.name)
-            .replace("{guild.icon}", icon_url)
-        )
+        return value.replace("{guild.name}", guild.name).replace("{guild.icon}", icon_url)
 
     def _set_footer(
         self,
@@ -159,36 +148,60 @@ class StickyService:
 
         embed.set_footer(
             text=footer_text or None,
-            icon_url=(
-                guild.icon.url
-                if has_guild_icon and guild.icon
-                else None
-            ),
+            icon_url=(guild.icon.url if has_guild_icon and guild.icon else None),
         )
 
     @staticmethod
     def _validate_content(content: str):
         if len(content) > 2000:
-            raise ValueError(
-                "Message content cannot exceed 2000 characters."
-            )
+            raise ValueError("Message content cannot exceed 2000 characters.")
 
     @staticmethod
     def _validate_embed(embed: discord.Embed):
+        if len(embed) > 6000:
+            raise ValueError("Embed text cannot exceed 6000 characters in total.")
+
         if embed.title and len(embed.title) > 256:
-            raise ValueError(
-                "Embed title cannot exceed 256 characters."
-            )
+            raise ValueError("Embed title cannot exceed 256 characters.")
 
         if embed.description and len(embed.description) > 4096:
-            raise ValueError(
-                "Embed description cannot exceed 4096 characters."
-            )
+            raise ValueError("Embed description cannot exceed 4096 characters.")
 
         if embed.footer.text and len(embed.footer.text) > 2048:
-            raise ValueError(
-                "Embed footer cannot exceed 2048 characters."
+            raise ValueError("Embed footer cannot exceed 2048 characters.")
+
+        if not any(
+            (
+                embed.title,
+                embed.description,
+                embed.footer.text,
+                embed.thumbnail.url,
+                embed.image.url,
             )
+        ):
+            raise ValueError("The embed must contain text or an image.")
+
+    def matches(self, message: discord.Message, script: str, guild: discord.Guild) -> bool:
+        """Identify a delivered sticky whose database pointer was not saved."""
+        content, embed = self.render(script, guild)
+        if message.content != content:
+            return False
+        if embed is None:
+            return not message.embeds
+        if len(message.embeds) != 1:
+            return False
+
+        def comparable(value):
+            if isinstance(value, dict):
+                return {
+                    key: comparable(item)
+                    for key, item in value.items()
+                    if key
+                    not in {"type", "flags", "proxy_url", "proxy_icon_url", "height", "width"}
+                }
+            return value
+
+        return comparable(message.embeds[0].to_dict()) == comparable(embed.to_dict())
 
     async def post(
         self,
@@ -198,9 +211,7 @@ class StickyService:
         content, embed = self.render(script, channel.guild)
 
         if not content and embed is None:
-            raise ValueError(
-                "The sticky script must contain text or an embed."
-            )
+            raise ValueError("The sticky script must contain text or an embed.")
 
         return await channel.send(
             content=content or None,

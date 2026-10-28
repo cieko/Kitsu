@@ -98,16 +98,27 @@ async def update_sticky_message_id(
     guild_id: int,
     channel_id: int,
     message_id: int | None,
-):
-    await asyncio.to_thread(
+    *,
+    pending_delete_id: int | None = None,
+) -> bool:
+    result = await asyncio.to_thread(
         sticky_collection.update_one,
         {
             "guild_id": guild_id,
             "channel_id": channel_id,
         },
         {
-            "$set": {"last_message_id": message_id}
+            "$set": {"last_message_id": message_id, "pending_delete_id": pending_delete_id}
         },
+    )
+    return result.matched_count > 0
+
+
+async def clear_sticky_cleanup(guild_id: int, channel_id: int, message_id: int) -> None:
+    await asyncio.to_thread(
+        sticky_collection.update_one,
+        {"guild_id": guild_id, "channel_id": channel_id, "pending_delete_id": message_id},
+        {"$unset": {"pending_delete_id": ""}},
     )
 
 

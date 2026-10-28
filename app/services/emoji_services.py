@@ -11,11 +11,23 @@ APPLICATION_EMOJIS = {
     "goos": 1558941112247394334,
     "translate": 1560016093366591539,
     "new": 1562883130267017261,
-    "gear": 1562886411034697778
+    "gear": 1562886411034697778,
+    "loading": 1564713766220865617,
+    "ghosty_track": 1564714687084634274,
 }
 
 
 _EMOJI_CACHE: dict[str, str] = {}
+
+
+def get_application_emoji_url(emoji_key: str) -> str | None:
+    """Build a thumbnail URL locally, using cached animation metadata."""
+    emoji_id = APPLICATION_EMOJIS.get(emoji_key)
+    if emoji_id is None:
+        return None
+    emoji = discord.PartialEmoji.from_str(_EMOJI_CACHE.get(emoji_key, f"<:{emoji_key}:{emoji_id}>"))
+    url = str(emoji.url)
+    return f"{url}{'&' if '?' in url else '?'}size=128"
 
 
 async def get_application_emoji(

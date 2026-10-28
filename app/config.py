@@ -13,8 +13,9 @@ class Settings(BaseSettings):
     flask_port: int = 5000
 
     ai_model_name: str = "kitsu_mod"
-    ai_model_url: str = ""
+    ai_model_url: str = "http://127.0.0.1:11434"
     ai_model_timeout: int = 30
+    ai_model_num_gpu: int | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

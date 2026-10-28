@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from discord.ext import commands, tasks
+from pymongo.errors import ConnectionFailure
 
 from app.database.repositories.schedule_repository import (
     get_active_schedules,
@@ -148,6 +149,7 @@ def parse_message_script(script: str):
 class ScheduleService:
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.scheduler_loop.add_exception_type(ConnectionFailure)
 
     @tasks.loop(seconds=1)
     async def scheduler_loop(self):

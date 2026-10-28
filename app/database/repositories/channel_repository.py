@@ -1,3 +1,5 @@
+import asyncio
+
 from app.database.session import db
 
 
@@ -31,7 +33,8 @@ async def set_channel_config(
     if whitelist_roles is not None:
         config["whitelist_roles"] = whitelist_roles
 
-    channel_configs.update_one(
+    await asyncio.to_thread(
+        channel_configs.update_one,
         {
             "guild_id": guild_id,
             "channel_id": channel_id,
@@ -47,7 +50,8 @@ async def reset_channel_config(
     guild_id: int,
     channel_id: int,
 ):
-    channel_configs.delete_one(
+    await asyncio.to_thread(
+        channel_configs.delete_one,
         {
             "guild_id": guild_id,
             "channel_id": channel_id,
@@ -59,7 +63,8 @@ async def get_channel_config(
     guild_id: int,
     channel_id: int,
 ):
-    return channel_configs.find_one(
+    return await asyncio.to_thread(
+        channel_configs.find_one,
         {
             "guild_id": guild_id,
             "channel_id": channel_id,
